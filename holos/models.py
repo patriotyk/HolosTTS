@@ -13,7 +13,7 @@ from holos.decoder import Decoder
 
 
 class VoiceEncoder(nn.Module):
-    def __init__(self, weights_path="patriotyk/holos", device='cuda'):
+    def __init__(self, weights_path="patriotyk/HolosTTS", device='cuda'):
         super().__init__()
         
         self.add_module('style_encoder', StyleEncoder())
@@ -39,10 +39,7 @@ class VoiceEncoder(nn.Module):
                 try:
                     resolved_weights_path = hf_hub_download(repo_id=weights_path, filename="voice_encoder.pt")
                 except Exception:
-                    try:
-                        resolved_weights_path = hf_hub_download(repo_id=weights_path, filename="holos.pt")
-                    except Exception:
-                        resolved_weights_path = None
+                    resolved_weights_path = None
 
             if resolved_weights_path and os.path.isfile(resolved_weights_path):
                 params = torch.load(resolved_weights_path, map_location=device)
@@ -101,7 +98,7 @@ class VoiceEncoder(nn.Module):
 
 
 class HolosTTS(nn.Module):
-    def __init__(self, weights_path="patriotyk/holos", device='cuda', onnx_phase_scale=0.0, voices_path="voices.pt"):
+    def __init__(self, weights_path="patriotyk/HolosTTS", device='cuda', onnx_phase_scale=0.0, voices_path="voices.pt"):
         super().__init__()
         
         self.add_module('text_encoder', TextEncoder())
