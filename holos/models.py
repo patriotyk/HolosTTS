@@ -210,7 +210,7 @@ class HolosTTS(nn.Module):
         
         duration = torch.sigmoid(d).sum(axis=-1) / 1.0
         pred_dur = torch.round(duration).clamp(min=1).long()[0]
-        print(pred_dur)
+        #print(pred_dur)
         #pred_dur[0] = 8
 
         pred_aln_trg = self.onnx_alignment(pred_dur, d_en.size(1))
