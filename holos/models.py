@@ -1,14 +1,107 @@
+import os
 import torch
 import numpy as np
 import torch.nn as nn
+import soundfile as sf
+import librosa
+import torchaudio
+from typing import Union
 from dataclasses import dataclass
+from huggingface_hub import hf_hub_download
 from holos.modules import StyleEncoder, TextEncoder, ProsodyPredictor, DurationPredictor, Tokenizer
 from holos.decoder import Decoder
 
 
+class VoiceEncoder(nn.Module):
+    def __init__(self, weights_path="patriotyk/holos", device='cuda'):
+        super().__init__()
+        
+        self.add_module('style_encoder', StyleEncoder())
+        self.add_module('prosodic_style_encoder', StyleEncoder())
+        
+        self.to_mel = torchaudio.transforms.MelSpectrogram(
+            sample_rate=16000,
+            n_fft=2048,
+            win_length=1200,
+            hop_length=300,
+            n_mels=80
+        )
+        
+        self.to(device)
+        self.device = device
+        self.eval()
+
+        if weights_path is not None:
+            resolved_weights_path = None
+            if os.path.isfile(weights_path):
+                resolved_weights_path = weights_path
+            else:
+                try:
+                    resolved_weights_path = hf_hub_download(repo_id=weights_path, filename="voice_encoder.pt")
+                except Exception:
+                    try:
+                        resolved_weights_path = hf_hub_download(repo_id=weights_path, filename="holos.pt")
+                    except Exception:
+                        resolved_weights_path = None
+
+            if resolved_weights_path and os.path.isfile(resolved_weights_path):
+                params = torch.load(resolved_weights_path, map_location=device)
+                if isinstance(params, dict) and 'state_dict' in params:
+                    state_dict = params['state_dict']
+                else:
+                    state_dict = params
+                
+                state_dict = {k.removeprefix('module.'): v for k, v in state_dict.items()}
+                self.load_state_dict(state_dict, strict=False)
+
+    def preprocess_audio(self, audio_path: str) -> torch.Tensor:
+        wave, sr = sf.read(audio_path)
+        if wave.ndim > 1:
+            wave = wave[:, 0].squeeze()
+        if sr != 24000:
+            wave = librosa.resample(wave, orig_sr=sr, target_sr=24000)
+
+
+        mean, std = -4, 4
+        wave_tensor = torch.from_numpy(wave).float().to(self.device)
+        mel_tensor = self.to_mel(wave_tensor)
+        mel_tensor = (torch.log(1e-5 + mel_tensor.unsqueeze(0)) - mean) / std
+
+        mel_tensor = mel_tensor.squeeze(0)
+        length_feature = mel_tensor.size(1)
+        mel_tensor = mel_tensor[:, :(length_feature - length_feature % 2)]
+        return mel_tensor.unsqueeze(0)  # [1, 80, T]
+
+    @torch.inference_mode()
+    def forward(self, audio_path_or_mel, max_sec: float = 30.0) -> torch.Tensor:
+        if isinstance(audio_path_or_mel, (str, os.PathLike)):
+            mel = self.preprocess_audio(str(audio_path_or_mel))
+        elif isinstance(audio_path_or_mel, torch.Tensor):
+            mel = audio_path_or_mel
+            if mel.dim() == 2:
+                mel = mel.unsqueeze(0)
+            mel = mel.to(self.device)
+        else:
+            raise ValueError(f"Expected audio file path (str) or mel spectrogram (torch.Tensor), got {type(audio_path_or_mel)}")
+
+        mel_input_length = torch.tensor([mel.shape[-1]], dtype=torch.long, device=self.device)
+
+        max_crop_len = 3300 if max_sec is None else min(int(max_sec * 24000 // 300), 3300)
+        crop_len = min(mel.shape[-1], max_crop_len)
+        mel_cropped = mel[:, :, :crop_len]
+        mel_crop_length = torch.tensor([crop_len], dtype=torch.long, device=self.device)
+
+        acoustic_style = self.style_encoder(mel, mel_input_length)
+        prosodic_style = self.prosodic_style_encoder(mel_cropped, mel_crop_length)
+
+        voice = torch.cat([acoustic_style, prosodic_style], dim=-1)
+        return voice
+
+    encode = forward
+
 
 class HolosTTS(nn.Module):
-    def __init__(self, weights_path=None, device='cuda', onnx_phase_scale=0.0):
+    def __init__(self, weights_path="patriotyk/holos", device='cuda', onnx_phase_scale=0.0, voices_path="voices.pt"):
         super().__init__()
         
         self.add_module('text_encoder', TextEncoder())
@@ -16,16 +109,38 @@ class HolosTTS(nn.Module):
         self.add_module('duration_predictor', DurationPredictor(d_hid=512))
         self.add_module('prosodic_predictor', ProsodyPredictor(d_hid=512))
         self.add_module('decoder', Decoder(onnx_phase_scale=onnx_phase_scale))
-        self.unk_style = nn.Parameter(torch.zeros(1, 128))
         self.to(device)
         self.device = device
         self.eval()
         self.voices = {}
+
         if weights_path is not None:
-            params = torch.load(weights_path, map_location=device)
-            self.tokenizer = Tokenizer(params['vocab'])
-            self.load_state_dict(params['state_dict'], strict=False)
-            self.voices = params['voices']
+            resolved_weights_path = None
+            if os.path.isfile(weights_path):
+                resolved_weights_path = weights_path
+            else:
+                resolved_weights_path = hf_hub_download(repo_id=weights_path, filename="holos.pt")
+            
+            params = torch.load(resolved_weights_path, map_location=device)
+            if isinstance(params, dict) and 'vocab' in params:
+                self.tokenizer = Tokenizer(params['vocab'])
+                self.load_state_dict(params['state_dict'], strict=True)
+            else:
+                self.load_state_dict(params, strict=True)
+
+            resolved_voices_path = None
+            if voices_path and os.path.isfile(voices_path):
+                resolved_voices_path = voices_path
+            elif not os.path.isfile(weights_path):
+                try:
+                    resolved_voices_path = hf_hub_download(repo_id=weights_path, filename="voices.pt")
+                except Exception:
+                    resolved_voices_path = None
+
+            if resolved_voices_path and os.path.isfile(resolved_voices_path):
+                self.voices = torch.load(resolved_voices_path, map_location=device)
+            else:
+                raise FileNotFoundError("Voices file not found")
 
     def set_onnx_phase_scale(self, value: float):
         self.decoder.generator.stft.set_onnx_phase_scale(value)
@@ -34,11 +149,14 @@ class HolosTTS(nn.Module):
         return list(self.voices.keys())
     
     @torch.inference_mode()
-    def generate(self, text: str, voice_name: str, index, alpha: float = 0.3) -> torch.Tensor:
-        #voice = torch.stack(self.voices[voice_name]).to(self.device).mean(dim=0, keepdim=True)
-        #print(self.voices[voice_name][0].shape)
-        voice = self.voices[voice_name][index].unsqueeze(0).to(self.device)
-        #voice = torch.load('voice_1_1.pt').to(self.device)
+    def generate(self, text: str, voice: Union[str, torch.Tensor]) -> torch.Tensor:
+        if isinstance(voice, torch.Tensor):
+            voice_tensor = voice
+            if voice_tensor.dim() == 1:
+                voice_tensor = voice_tensor.unsqueeze(0)
+            voice_tensor = voice_tensor.to(self.device)
+        else:
+            voice_tensor = self.voices[voice].unsqueeze(0).to(self.device)
 
         tokens = self.tokenizer(text)
         tokens.insert(0, 0)
@@ -47,7 +165,7 @@ class HolosTTS(nn.Module):
         tokens = torch.tensor(tokens).unsqueeze(0).to(self.device)
         input_lengths = torch.tensor([tokens.size(1)], dtype=torch.long, device=self.device)
         
-        return self.forward(tokens, voice, input_lengths, alpha)
+        return self.forward(tokens, voice_tensor, input_lengths)
 
     
         
@@ -83,7 +201,7 @@ class HolosTTS(nn.Module):
     
     
     @torch.no_grad()
-    def encode(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor, alpha: float = 0.3):
+    def encode(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor):
         """Encoder part: text → aligned features, f0, energy. No decoder."""
         voice_acoustic = voice[:, :128]
         voice_prosodic = voice[:, 128:]
@@ -91,13 +209,7 @@ class HolosTTS(nn.Module):
         t_en = self.prosodic_text_encoder(tokens, input_lengths)
         d_en = t_en.transpose(1, 2)
         
-        if alpha > 0.0:
-            unk = self.unk_style.expand(voice_prosodic.size(0), -1)
-            d_uncond = self.duration_predictor(d_en, unk, input_lengths)
-            d_cond = self.duration_predictor(d_en, voice_prosodic, input_lengths)
-            d = d_cond * (1 - alpha) + d_uncond * alpha
-        else:
-            d = self.duration_predictor(d_en, voice_prosodic, input_lengths)
+        d = self.duration_predictor(d_en, voice_prosodic, input_lengths)
         
         duration = torch.sigmoid(d).sum(axis=-1) / 1.0
         pred_dur = torch.round(duration).clamp(min=1).long()[0]
@@ -142,21 +254,14 @@ class HolosTTS(nn.Module):
         en = d_en.transpose(-1, -2) @ pred_aln_trg
         wav_lengths = pred_dur.sum(dim=0, keepdim=True) * 2
         
-        if alpha > 0.0:
-            unk = self.unk_style.expand(voice_prosodic.size(0), -1)
-            f0_uncond, energy_uncond = self.prosodic_predictor(en, unk, wav_lengths)
-            f0_cond, energy_cond = self.prosodic_predictor(en, voice_prosodic, wav_lengths)
-            f0 = f0_cond * (1 - alpha) + f0_uncond * alpha
-            energy = energy_cond * (1 - alpha) + energy_uncond * alpha
-        else:
-            f0, energy = self.prosodic_predictor(en, voice_prosodic, wav_lengths)
+        f0, energy = self.prosodic_predictor(en, voice_prosodic, wav_lengths)
         t_en = self.text_encoder(tokens, input_lengths)
         aln = t_en @ pred_aln_trg
         return aln, f0, energy, voice_acoustic, wav_lengths
 
 
     @torch.no_grad()
-    def forward(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor, alpha: float = 0.3) -> torch.Tensor:
-        aln, f0, energy, voice_acoustic, wav_lengths = self.encode(tokens, voice, input_lengths, alpha)
-        wave = self.decoder(aln, f0, energy, voice_acoustic, wav_lengths)
+    def forward(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
+        encoded = self.encode(tokens, voice, input_lengths)
+        wave = self.decoder(*encoded)
         return wave.squeeze(0)
