@@ -4,5 +4,5 @@ numpy
 scipy
 transformers
 ukrainian-word-stress @ git+https://github.com/patriotyk/ukrainian-word-stress.git
-ukrainian-ipa @ git+https://github.com/patriotyk/ipa-uk.git
+ipa-uk @ git+https://github.com/patriotyk/ipa-uk.git
 huggingface-hub
