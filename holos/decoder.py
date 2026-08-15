@@ -19,14 +19,11 @@ def init_weights(m, mean=0.0, std=0.01):
 
 
 class CustomSTFT(torch.nn.Module):
-    def __init__(self, n_fft=800, hop_length=200, win_length=800, window='hann', onnx_phase_scale=0.0):
+    def __init__(self, n_fft=800, hop_length=200, win_length=800, window='hann'):
         super().__init__()
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
-        # ONNX path is highly sensitive to phase jitter from tiny upstream differences.
-        # We attenuate harmonic phase during export to avoid narrow-band whistle artifacts.
-        self.onnx_phase_scale = float(onnx_phase_scale)
         
         w = torch.from_numpy(get_window(window, win_length, fftbins=True).astype(np.float32))
         self.register_buffer("window", w, persistent=False)
@@ -50,16 +47,14 @@ class CustomSTFT(torch.nn.Module):
         idft_mat = idft_weights_mat.transpose(0, 1).unsqueeze(-1) # [n_fft, 2F, 1]
         self.register_buffer("idft_weight", idft_mat, persistent=False)
 
-        # Overlap add sum
-        max_frames = 100096
-        n = n_fft + hop_length * (max_frames - 1)
-        window_sum = torch.zeros(n)
-        win_sq = w ** 2
-        for i in range(max_frames):
-            s = i * hop_length
-            window_sum[s : min(n, s + n_fft)] += win_sq[:min(n_fft, n-s)]
-            
-        self.register_buffer("window_sum_inv", 1.0 / window_sum.clamp(min=1e-8), persistent=False)
+        # Exact overlap-add denominator. It is expanded to the actual number of
+        # frames in inverse(), avoiding incorrect tail normalization from a
+        # fixed, precomputed maximum-frame buffer.
+        self.register_buffer(
+            "window_sq_weight",
+            w.square().view(1, 1, n_fft),
+            persistent=False,
+        )
 
         # Pre-compute frame offsets and DFT basis for fast, accurate GPU transform
         self.register_buffer("frame_offsets", torch.arange(n_fft), persistent=False)
@@ -68,9 +63,13 @@ class CustomSTFT(torch.nn.Module):
 
     
     
-    def transform(self, input_data):
-        # Use explicit gather + DFT matmul to keep ONNX phase numerically stable.
-        # Conv1D and ONNX produce tiny real/imag deviations that are amplified by atan2.
+    def transform_components(self, input_data):
+        """Return continuous real/imaginary STFT components.
+
+        This representation contains the same information as magnitude/phase but
+        has no discontinuity at -pi/pi, so it is the preferred harmonic-source
+        representation for newly trained models.
+        """
         x = input_data.unsqueeze(1)
         pad = self.n_fft // 2
         left = x[:, :, 1 : pad + 1].flip(dims=[-1])
@@ -82,46 +81,56 @@ class CustomSTFT(torch.nn.Module):
 
         real = out[:, :self.n_fft // 2 + 1, :]
         imag = out[:, self.n_fft // 2 + 1:, :]
+        return real, imag
+
+    def transform(self, input_data):
+        """Return magnitude/phase features compatible with existing checkpoints."""
+        real, imag = self.transform_components(input_data)
 
         magnitude = torch.sqrt(real**2 + imag**2 + 1e-8)
-        phase = torch.zeros_like(real)
-        if torch.onnx.is_in_onnx_export() and self.onnx_phase_scale == 0.0:
-            # For export with zero phase scale, skip atan2 completely.
-            # This is mathematically equivalent to atan2(...) * 0 but keeps
-            # the ONNX graph smaller and avoids extra phase numerics.
-            phase = torch.zeros_like(real)
-        else:
-            phase = torch.atan2(imag, real)
-            if torch.onnx.is_in_onnx_export():
-                phase = phase * self.onnx_phase_scale
+        phase = torch.atan2(imag, real)
+
+        # The ONNX Atan2 decomposition evaluates 0 / 0 as NaN, whereas
+        # torch.atan2(0, 0) returns 0. Masked harmonic-source tails contain
+        # exactly these zero complex bins, so canonicalize them explicitly.
+        zero_complex = (real == 0) & (imag == 0)
+        phase = torch.where(zero_complex, torch.zeros_like(phase), phase)
+
+        # The imaginary part of the DC bin is mathematically zero. For a
+        # negative real value, PyTorch returns +pi while ONNX Runtime's
+        # Atan2 decomposition returns -pi. Both angles describe the same
+        # complex number, but the following Conv1d treats them as values
+        # separated by 2*pi. Canonicalize DC to PyTorch's convention.
+        dc_phase = torch.where(
+            real[:, :1, :] < 0,
+            torch.full_like(real[:, :1, :], torch.pi),
+            torch.zeros_like(real[:, :1, :]),
+        )
+        phase = torch.cat([dc_phase, phase[:, 1:, :]], dim=1)
 
         return magnitude, phase
-
-    def set_onnx_phase_scale(self, value: float):
-        self.onnx_phase_scale = float(value)
 
     def inverse(self, magnitude, phase):
         re = magnitude * torch.cos(phase)
         im = magnitude * torch.sin(phase)
         x = torch.cat([re, im], dim=1) # [B, 2*F, T]
         
-        B, F2, T = x.shape
-        
         # 2. Frame Synthesis and Overlap-Add via ConvTranspose1d
         # x is [B, 2F, T]. idft_weight is [n_fft, 2F, 1]
         weight = self.idft_weight.squeeze(2).transpose(0, 1).unsqueeze(1) # [2F, 1, n_fft]
         output = F.conv_transpose1d(x, weight, stride=self.hop_length)
         
-        # 4. Normalization and Slicing (center=True)
-        # Apply the pre-calculated overlap-add normalization
-        if torch.onnx.is_in_onnx_export():
-            L = output.size(-1)
-            output = output * self.window_sum_inv[None, None, :L]
-        else:
-            output = output * self.window_sum_inv[None, None, :output.size(-1)]        
+        # Exact overlap-add normalization for the actual frame count. Computing
+        # this with ConvTranspose1d keeps dynamic lengths ONNX-exportable.
+        window_sum = F.conv_transpose1d(
+            torch.ones_like(x[:, :1, :]),
+            self.window_sq_weight,
+            stride=self.hop_length,
+        )
+        output = output / window_sum.clamp(min=1e-8)
+
+        # center=True removes n_fft // 2 samples from both ends.
         cutoff = self.half_n_fft
-        if torch.onnx.is_in_onnx_export():
-            return output
         return output[:, :, cutoff : -cutoff]
 
     def forward(self, input_data):
@@ -269,8 +278,15 @@ class SourceModuleHnNSF(torch.nn.Module):
 
 
 class Generator(torch.nn.Module):
-    def __init__(self, style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, onnx_phase_scale=0.0):
+    def __init__(self, style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, harmonic_representation="polar"):
         super(Generator, self).__init__()
+
+        if harmonic_representation not in {"polar", "cartesian"}:
+            raise ValueError(
+                "harmonic_representation must be 'polar'"
+                "or 'cartesian'"
+            )
+        self.harmonic_representation = harmonic_representation
 
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
@@ -321,8 +337,15 @@ class Generator(torch.nn.Module):
             n_fft=gen_istft_n_fft,
             hop_length=gen_istft_hop_size,
             win_length=gen_istft_n_fft,
-            onnx_phase_scale=onnx_phase_scale,
         )
+
+    def harmonic_features(self, source):
+        if self.harmonic_representation == "cartesian":
+            real, imag = self.stft.transform_components(source)
+            return torch.cat([real, imag], dim=1)
+
+        magnitude, phase = self.stft.transform(source)
+        return torch.cat([magnitude, phase], dim=1)
         
         
     def forward(self, x, s, f0, full_mask, lengths):
@@ -337,8 +360,7 @@ class Generator(torch.nn.Module):
             har_source = self.m_source(f0_upsampled)
             har_source = (har_source.transpose(1, 2) * audio_mask).squeeze(1)
 
-            har_spec, har_phase = self.stft.transform(har_source)
-            har = torch.cat([har_spec, har_phase], dim=1)
+            har = self.harmonic_features(har_source)
         
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, 0.1)
@@ -379,8 +401,7 @@ class Generator(torch.nn.Module):
             har_source = self.m_source(f0_upsampled)
             har_source = har_source.transpose(1, 2)[:, 0, :]
 
-            har_spec, har_phase = self.stft.transform(har_source)
-            har = torch.cat([har_spec, har_phase], dim=1)
+            har = self.harmonic_features(har_source)
         
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, 0.1)
@@ -427,7 +448,7 @@ class Decoder(nn.Module):
                 resblock_dilation_sizes=[[1,3,5], [1,3,5], [1,3,5]],
                 upsample_kernel_sizes=[12, 10], 
                 gen_istft_n_fft=40, gen_istft_hop_size=10,
-                onnx_phase_scale=0.0):
+                harmonic_representation="polar"):
         super().__init__()
         
         self.decode = nn.ModuleList()
@@ -451,7 +472,7 @@ class Decoder(nn.Module):
         self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, 
                                    upsample_initial_channel, resblock_dilation_sizes, 
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size,
-                                   onnx_phase_scale=onnx_phase_scale)
+                                   harmonic_representation=harmonic_representation)
         
     def forward(self, asr, F0_curve, N, s, lengths=None):
         
@@ -513,7 +534,7 @@ class DecoderNoN(nn.Module):
                 resblock_dilation_sizes=[[1,3,5], [1,3,5], [1,3,5]],
                 upsample_kernel_sizes=[12, 10], 
                 gen_istft_n_fft=40, gen_istft_hop_size=10,
-                onnx_phase_scale=0.0):
+                harmonic_representation="polar"):
         super().__init__()
         
         self.decode = nn.ModuleList()
@@ -537,7 +558,7 @@ class DecoderNoN(nn.Module):
         self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, 
                                    upsample_initial_channel, resblock_dilation_sizes, 
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size,
-                                   onnx_phase_scale=onnx_phase_scale)
+                                   harmonic_representation=harmonic_representation)
         
     def forward(self, asr, F0_curve, s, lengths=None):
         
