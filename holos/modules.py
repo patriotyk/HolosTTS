@@ -1,5 +1,6 @@
 import math
 import torch
+import numpy as np
 import torch.nn as nn
 from torch.nn import Conv1d
 import torch.nn.functional as F
@@ -28,10 +29,13 @@ def get_padding(kernel_size, dilation=1):
 
 class Tokenizer:
     def __init__(self, vocab):
+        self.vocab = list(vocab) if not isinstance(vocab, list) else vocab
         self.dict = {}
+        self.inv_dict = {}
         self.symbols_count = len(vocab)
         for i in range(self.symbols_count):
             self.dict[vocab[i]] = i
+            self.inv_dict[i] = vocab[i]
 
     def __call__(self, text):
         indexes = []
@@ -41,6 +45,30 @@ class Tokenizer:
             except KeyError:
                 pass
         return indexes
+
+    def decode(self, tokens, as_list: bool = False):
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.tolist()
+        elif isinstance(tokens, np.ndarray):
+            tokens = tokens.tolist()
+        elif isinstance(tokens, (int, np.integer)):
+            tokens = [int(tokens)]
+
+        decoded = []
+        for t in tokens:
+            t = int(t)
+            if t == 0:
+                decoded.append('$')
+            elif t in self.inv_dict:
+                decoded.append(self.inv_dict[t])
+            elif 0 <= t < len(self.vocab):
+                decoded.append(self.vocab[t])
+            else:
+                decoded.append('$')
+
+        if as_list:
+            return decoded
+        return ''.join(decoded)
 
 
 class MaskedInstanceNorm1d(nn.Module):
@@ -566,6 +594,7 @@ class FiLM(nn.Module):
             self.style_weight = nn.Parameter(torch.tensor(float(style_weight)))
         else:
             self.register_buffer('style_weight', torch.tensor(float(style_weight)))
+        self.learnable_weight = bool(learnable_weight)
 
     def forward(self, h, style):
         """
@@ -579,7 +608,14 @@ class FiLM(nn.Module):
         beta = self.beta(style).unsqueeze(1)    # [B, 1, D]
         modulated = gamma * h + beta
         
-        w = torch.sigmoid(self.style_weight) if self.style_weight.requires_grad else self.style_weight.clamp(0.0, 1.0)
+        # Whether this value is transformed is part of the model architecture,
+        # not the current autograd configuration. Exporters commonly disable
+        # gradients, which must not change inference semantics.
+        w = (
+            torch.sigmoid(self.style_weight)
+            if self.learnable_weight
+            else self.style_weight.clamp(0.0, 1.0)
+        )
         return (1.0 - w) * h + w * modulated
 
 
