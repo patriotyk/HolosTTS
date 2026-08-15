@@ -5,6 +5,9 @@ import tempfile
 import numpy as np
 import torch
 from unicodedata import normalize
+import time
+import onnxruntime as ort
+from holos_onnx import HolosTTS as HolosTTSONNX
 
 try:
     import gradio as gr
@@ -36,6 +39,45 @@ ve_path = 'voice_encoder.pt' if os.path.isfile('voice_encoder.pt') else 'patriot
 
 model = HolosTTS(model_path, device=device)
 voice_encoder = VoiceEncoder(ve_path, device=device)
+ 
+session = ort.InferenceSession(
+    'holos.onnx',
+    providers=["CPUExecutionProvider"],
+)
+
+onnx_model = HolosTTSONNX('.')  # CPUExecutionProvider by default
+print(model.list_voices())
+
+
+def to_int16(wav_chunks):
+    chunks = []
+    for chunk in wav_chunks:
+        if isinstance(chunk, torch.Tensor):
+            chunk = chunk.detach().cpu().numpy()
+        chunks.append(np.asarray(chunk, dtype=np.float32).reshape(-1))
+
+    data = np.concatenate(chunks)
+    if not np.isfinite(data).all():
+        raise gr.Error("Модель згенерувала некоректне аудіо (NaN або Inf)")
+
+    peak = np.max(np.abs(data), initial=0.0)
+    if peak > 0:
+        data = data / peak
+    return (data * 32767).astype(np.int16)
+
+
+def voice_to_onnx_input(voice):
+    if isinstance(voice, str):
+        voice = model.voices[voice]
+    if not isinstance(voice, torch.Tensor):
+        voice = torch.as_tensor(voice)
+
+    voice = voice.detach().to(device="cpu", dtype=torch.float32)
+    if voice.dim() == 1:
+        voice = voice.unsqueeze(0)
+    if tuple(voice.shape) != (1, 256):
+        raise gr.Error(f"Очікував voice embedding [1, 256], отримав {tuple(voice.shape)}")
+    return voice.numpy()
 
 
 def split_to_parts(text, group=True):
@@ -100,6 +142,8 @@ def synthesize(text, voice_name, custom_voice=None, progress=gr.Progress()):
     voice = custom_voice if custom_voice is not None else voice_name
 
     result_wav = []
+    result_wav_onnx = []
+    onnx_voice = voice_to_onnx_input(voice)
     for t in progress.tqdm(split_to_parts(text)):
         t = t.strip()
         t = t.replace('"', '')
@@ -116,15 +160,40 @@ def synthesize(text, voice_name, custom_voice=None, progress=gr.Progress()):
 
             if ps:
                 print(ps)
+                start = time.time()
                 wav = model.generate(ps, voice).squeeze()
+                print('PyTorch done in: ', time.time() - start)
                 result_wav.append(wav)
 
-    data = torch.concatenate(result_wav).cpu().numpy()
-    data = data / np.abs(data).max()
-    data = data * 32767
-    data = data.astype(np.int16)
 
-    return 24000, data
+
+                tokens = [0] + model.tokenizer(ps) + [0]
+                start = time.time()
+                onnx_audio, onnx_audio_lengths = session.run(
+                    ["audio", "audio_lengths"],
+                    {
+                        "tokens": np.asarray([tokens], dtype=np.int64),
+                        "voice": onnx_voice,
+                        "input_lengths": np.asarray([len(tokens)], dtype=np.int64),
+                    },
+                )
+                # result = onnx_model.generate_with_details(
+                #     ps,
+                #     voice=voice_name,
+                # )
+                print('ONNX done in: ', time.time() - start)
+                #print(result.frame_count, result.audio_length, result.sample_rate)
+
+                
+                result_wav_onnx.append(onnx_audio)
+
+
+    return (
+        (24000, to_int16(result_wav)),
+        (24000, to_int16(result_wav_onnx)),
+    )
+
+
 
 
 def select_example(df, evt: gr.SelectData):
@@ -157,10 +226,15 @@ def create_demo():
                     streaming=False,
                     type="numpy",
                 )
-                synthesise_button = gr.Button("Синтезувати")
-                multi = gr.Text(value='multi', visible=False)
+                output_audio_onnx = gr.Audio(
+                    label="Audio (ONNX):",
+                    autoplay=False,
+                    streaming=False,
+                    type="numpy",
+                )
 
-                synthesise_button.click(synthesize, inputs=[input_text, speaker, style_state], outputs=[output_audio])
+                synthesise_button = gr.Button("Синтезувати")
+                synthesise_button.click(synthesize, inputs=[input_text, speaker, style_state], outputs=[output_audio, output_audio_onnx])
                 audio_prompt.change(encode_audio_prompt, inputs=[audio_prompt], outputs=[style_state, style_download])
 
         with gr.Row():

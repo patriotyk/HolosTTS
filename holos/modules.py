@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.nn import Conv1d
 import torch.nn.functional as F
 from torch.nn.utils.parametrizations import weight_norm
+from torch.onnx import symbolic_helper
 from torchaudio.models import Conformer
 from transformers import AlbertConfig, AlbertModel
 
@@ -75,15 +76,36 @@ class MaskedInstanceNorm1d(nn.Module):
     def __init__(self, num_features, eps=1e-5):
         super().__init__()
         self.eps = eps
+        # Explicit affine identities let the legacy ONNX exporter emit
+        # InstanceNormalization even after a dynamic Slice has obscured the
+        # channel dimension. Non-persistent buffers do not alter checkpoints.
+        self.register_buffer(
+            "onnx_weight",
+            torch.ones(num_features),
+            persistent=False,
+        )
+        self.register_buffer(
+            "onnx_bias",
+            torch.zeros(num_features),
+            persistent=False,
+        )
 
     def forward(self, x, mask=None):
         if mask is None:
-            if not torch.onnx.is_in_onnx_export():
-                return F.instance_norm(x, eps=self.eps)
-            mask = torch.ones(x.shape[0], 1, x.shape[2], device=x.device, dtype=x.dtype)
+            return F.instance_norm(
+                x,
+                weight=self.onnx_weight,
+                bias=self.onnx_bias,
+                eps=self.eps,
+            )
     
         if not torch.onnx.is_in_onnx_export() and mask.min() == 1.0:
-            return F.instance_norm(x, eps=self.eps)
+            return F.instance_norm(
+                x,
+                weight=self.onnx_weight,
+                bias=self.onnx_bias,
+                eps=self.eps,
+            )
 
         valid_lengths = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
         mean = (x * mask).sum(dim=-1, keepdim=True) / valid_lengths
@@ -325,17 +347,92 @@ class RotaryPositionalEmbedding(nn.Module):
         return torch.stack([out1, out2], dim=-1).flatten(-2)  # [B, nhead, T, head_dim]
 
 
+class _OnnxRuntimeAttention(torch.autograd.Function):
+    """Export SDPA as ONNX Runtime's fused MultiHeadAttention operator."""
+
+    @staticmethod
+    def forward(ctx, query, key, value, num_heads):
+        batch, text_length, hidden = query.shape
+        head_dim = hidden // num_heads
+        query = query.view(batch, text_length, num_heads, head_dim)
+        query = query.permute(0, 2, 1, 3)
+        context = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        return context.permute(0, 2, 1, 3).reshape(
+            batch,
+            text_length,
+            hidden,
+        )
+
+    @staticmethod
+    def symbolic(graph, query, key, value, num_heads):
+        output = graph.op(
+            "com.microsoft::MultiHeadAttention",
+            query,
+            key,
+            value,
+            num_heads_i=symbolic_helper._parse_arg(num_heads, "i"),
+        )
+        return output.setType(query.type())
+
+
+class _OnnxRuntimeMaskedAttention(torch.autograd.Function):
+    """Masked variant of ONNX Runtime's fused attention operator."""
+
+    @staticmethod
+    def forward(ctx, query, key, value, key_mask, num_heads):
+        batch, text_length, hidden = query.shape
+        head_dim = hidden // num_heads
+        query = query.view(batch, text_length, num_heads, head_dim)
+        query = query.permute(0, 2, 1, 3)
+        attention_mask = key_mask.bool().unsqueeze(1).unsqueeze(2)
+        context = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        return context.permute(0, 2, 1, 3).reshape(
+            batch,
+            text_length,
+            hidden,
+        )
+
+    @staticmethod
+    def symbolic(graph, query, key, value, key_mask, num_heads):
+        missing_bias = symbolic_helper._optional_input_placeholder_tensor(graph)
+        output = graph.op(
+            "com.microsoft::MultiHeadAttention",
+            query,
+            key,
+            value,
+            missing_bias,
+            key_mask,
+            num_heads_i=symbolic_helper._parse_arg(num_heads, "i"),
+        )
+        return output.setType(query.type())
+
+
 class EncoderLayerONNX(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, activation="gelu"):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
         self.head_dim = d_model // nhead
+        self.dim_feedforward = dim_feedforward
         assert self.head_dim * nhead == d_model, "d_model must be divisible by nhead"
 
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
+        self.qkv_proj = None
         self.out_proj = nn.Linear(d_model, d_model)
 
         self.activation_type = activation
@@ -344,6 +441,7 @@ class EncoderLayerONNX(nn.Module):
         if activation == "swiglu":
             self.gate_proj = nn.Linear(d_model, dim_feedforward)
             self.up_proj = nn.Linear(d_model, dim_feedforward)
+            self.gate_up_proj = None
             self.down_proj = nn.Linear(dim_feedforward, d_model)
         else:
             self.fc1 = nn.Linear(d_model, dim_feedforward)
@@ -356,6 +454,50 @@ class EncoderLayerONNX(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+
+    @staticmethod
+    def _fuse_linears(linears):
+        first = linears[0]
+        if any(layer.in_features != first.in_features for layer in linears):
+            raise ValueError("Cannot fuse linear layers with different input sizes")
+
+        has_bias = first.bias is not None
+        if any((layer.bias is not None) != has_bias for layer in linears):
+            raise ValueError("Cannot fuse linear layers with mixed bias settings")
+
+        # Linear initializes randomly before the weights are overwritten. Keep
+        # model construction from perturbing the caller's inference RNG stream.
+        with torch.random.fork_rng():
+            fused = nn.Linear(
+                first.in_features,
+                sum(layer.out_features for layer in linears),
+                bias=has_bias,
+            ).to(device=first.weight.device, dtype=first.weight.dtype)
+        with torch.no_grad():
+            fused.weight.copy_(torch.cat([layer.weight for layer in linears], dim=0))
+            if has_bias:
+                fused.bias.copy_(torch.cat([layer.bias for layer in linears], dim=0))
+        fused.train(first.training)
+        return fused
+
+    def fuse_inference_projections(self):
+        """Pack independent projections after loading an inference checkpoint."""
+        if self.qkv_proj is None:
+            self.qkv_proj = self._fuse_linears(
+                [self.q_proj, self.k_proj, self.v_proj]
+            )
+            self.q_proj = None
+            self.k_proj = None
+            self.v_proj = None
+
+        if self.activation_type == "swiglu" and self.gate_up_proj is None:
+            self.gate_up_proj = self._fuse_linears(
+                [self.gate_proj, self.up_proj]
+            )
+            self.gate_proj = None
+            self.up_proj = None
+
+        return self
 
     def _split_heads(self, x):
         # x: [B, T, D] -> [B, nhead, T, head_dim]
@@ -375,9 +517,12 @@ class EncoderLayerONNX(nn.Module):
         B, T, D = src.size()
 
         # --- Self-attention (scaled dot-product) ---
-        q = self.q_proj(src)  # [B, T, D]
-        k = self.k_proj(src)
-        v = self.v_proj(src)
+        if self.qkv_proj is None:
+            q = self.q_proj(src)  # [B, T, D]
+            k = self.k_proj(src)
+            v = self.v_proj(src)
+        else:
+            q, k, v = self.qkv_proj(src).split(self.d_model, dim=-1)
 
         q = self._split_heads(q)  # [B, nhead, T, head_dim]
         k = self._split_heads(k)
@@ -386,32 +531,44 @@ class EncoderLayerONNX(nn.Module):
         if rope is not None:
             q, k = rope(q, k)
 
-        if not torch.onnx.is_in_onnx_export():
-            # Use SDPA for FlashAttention / memory-efficient attention
+        if torch.onnx.is_in_onnx_export():
+            if self.training:
+                raise RuntimeError("Fused ONNX Attention export requires eval mode")
+            query = self._combine_heads(q)
+            context = (
+                _OnnxRuntimeAttention.apply(query, k, v, self.nhead)
+                if src_key_padding_mask is None
+                else _OnnxRuntimeMaskedAttention.apply(
+                    query,
+                    k,
+                    v,
+                    (~src_key_padding_mask).to(torch.int32),
+                    self.nhead,
+                )
+            )
+        else:
             attn_mask = None
             if src_key_padding_mask is not None:
-                # src_key_padding_mask: [B, T] with True where padding
-                # SDPA expects additive mask: 0 for valid, -inf for masked
-                attn_mask = torch.zeros(B, 1, 1, T, device=q.device, dtype=q.dtype)
-                attn_mask.masked_fill_(src_key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+                attn_mask = torch.zeros(
+                    B,
+                    1,
+                    1,
+                    T,
+                    device=q.device,
+                    dtype=q.dtype,
+                )
+                attn_mask.masked_fill_(
+                    src_key_padding_mask.unsqueeze(1).unsqueeze(2),
+                    float("-inf"),
+                )
             context = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout.p if self.training else 0.0,
                 is_causal=False,
             )
-        else:
-            # Manual attention for ONNX export compatibility
-            k_t = k.permute(0, 1, 3, 2)
-            scores = torch.matmul(q, k_t) / (self.head_dim ** 0.5)
-            if src_key_padding_mask is not None:
-                mask = src_key_padding_mask.unsqueeze(1).unsqueeze(2)
-                scores = scores + (mask.to(dtype=scores.dtype) * -1e9)
-            attn = torch.softmax(scores, dim=-1)
-            attn = self.dropout(attn)
-            context = torch.matmul(attn, v)
+            context = self._combine_heads(context)
 
-        context = self._combine_heads(context)  # [B,T,D]
         attn_out = self.out_proj(context)
         attn_out = self.dropout(attn_out)
 
@@ -420,7 +577,15 @@ class EncoderLayerONNX(nn.Module):
 
         # --- Feed-forward ---
         if self.activation_type == "swiglu":
-            ff = self.down_proj(F.silu(self.gate_proj(src2)) * self.up_proj(src2))
+            if self.gate_up_proj is None:
+                gate = self.gate_proj(src2)
+                up = self.up_proj(src2)
+            else:
+                gate, up = self.gate_up_proj(src2).split(
+                    self.dim_feedforward,
+                    dim=-1,
+                )
+            ff = self.down_proj(F.silu(gate) * up)
         else:
             ff = self.fc2(self.activation(self.fc1(src2)))
             
@@ -803,3 +968,26 @@ class ProsodyPredictor(nn.Module):
         N = self.N_proj(N) * mask2x
         
         return F0[:, 0], N[:, 0]
+
+    def inference(self, en, style):
+        """Exact-length batch inference without padding masks."""
+        x = self.input_proj(en.transpose(-1, -2))
+        x = self.film(x, style)
+        x = x + self.conv_pe(x)
+
+        for layer in self.layers:
+            x = layer(x, src_key_padding_mask=None, rope=self.rope)
+
+        x = x.transpose(-1, -2)
+
+        f0 = x
+        for block in self.F0:
+            f0 = block(f0, style)
+        f0 = self.F0_proj(f0)
+
+        energy = x
+        for block in self.N:
+            energy = block(energy, style)
+        energy = self.N_proj(energy)
+
+        return f0[:, 0], energy[:, 0]

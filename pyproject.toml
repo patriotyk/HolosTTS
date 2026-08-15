@@ -13,12 +13,19 @@ dynamic = ["dependencies"]
 gradio = [
     "gradio",
 ]
+onnx = [
+    "onnx",
+    "onnxruntime",
+]
 
 [project.scripts]
 holos-app = "gradio_app.app:main"
+holos-export-onnx = "holos.onnx_export:main"
+holos-convert-voices = "holos.voices:main"
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements_inference.txt"]}
 
 [tool.setuptools.packages.find]
 include = ["holos*", "gradio_app*"]
+exclude = ["holos_onnx*"]

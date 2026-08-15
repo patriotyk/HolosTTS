@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "holos-onnx"
+version = "0.1.0"
+description = "PyTorch-free ONNX Runtime inference for HolosTTS"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "onnxruntime>=1.18",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

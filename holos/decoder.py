@@ -410,6 +410,10 @@ class Generator(torch.nn.Module):
                 x = self.reflection_pad(x)
 
             x_source = self.noise_convs[i](har)
+            # The final reflection pad makes x one sample longer than the
+            # harmonic branch. Slice by the dynamic source length without
+            # constructing a padding mask.
+            x = x[..., :x_source.size(-1)]
             x_source = self.noise_res[i](x_source, s)
 
             x = (x + x_source)
@@ -523,6 +527,25 @@ class Decoder(nn.Module):
         else:
             x = self.generator.inference(x, s, F0_curve)
         return x
+
+    def inference(self, asr, F0_curve, N, s):
+        """Decode exact-length batch data without constructing padding masks."""
+        F0 = self.F0_conv(F0_curve.unsqueeze(1))
+        N = self.N_conv(N.unsqueeze(1))
+
+        x = torch.cat([asr, F0, N], axis=1)
+        x = self.encode(x, s)
+        asr_res = self.asr_res(asr)
+
+        res = True
+        for block in self.decode:
+            if res:
+                x = torch.cat([x, asr_res, F0, N], axis=1)
+            x = block(x, s)
+            if block.upsample_type != "none":
+                res = False
+
+        return self.generator.inference(x, s, F0_curve)
     
 
 

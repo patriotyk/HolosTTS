@@ -1,15 +1,84 @@
 import os
+from pathlib import Path
+
 import torch
 import numpy as np
 import torch.nn as nn
+from torch.nn.utils import parametrize
 import soundfile as sf
 import librosa
 import torchaudio
 from typing import Union
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
-from holos.modules import StyleEncoder, TextEncoder, ProsodyPredictor, DurationPredictor, Tokenizer
+from holos.modules import (
+    DurationPredictor,
+    EncoderLayerONNX,
+    ProsodyPredictor,
+    StyleEncoder,
+    TextEncoder,
+    Tokenizer,
+)
 from holos.decoder import Decoder
+from holos.voices import load_voice_embeddings
+
+
+def _remove_weight_norm(module):
+    """Materialize weight-normalized weights for an inference-only instance."""
+    for child in module.modules():
+        if parametrize.is_parametrized(child, "weight"):
+            parametrize.remove_parametrizations(
+                child,
+                "weight",
+                leave_parametrized=True,
+            )
+
+
+def _fuse_transformer_projections(module):
+    """Pack transformer GEMMs only in a constructed inference model."""
+    layers = [
+        child
+        for child in module.modules()
+        if isinstance(child, EncoderLayerONNX)
+    ]
+    for layer in layers:
+        layer.fuse_inference_projections()
+
+
+def _resolve_voices_path(weights_path, voices_path):
+    weights_is_file = os.path.isfile(weights_path)
+    requested = Path(voices_path).expanduser() if voices_path else None
+    if requested is not None and requested.is_file():
+        return os.path.abspath(requested)
+
+    roots = []
+    if weights_is_file:
+        roots.append(Path(os.path.abspath(Path(weights_path).expanduser())).parent)
+    if requested is not None:
+        roots.append(Path(os.path.abspath(requested.parent)))
+    roots.append(Path.cwd())
+
+    unique_roots = []
+    for root in roots:
+        if root not in unique_roots:
+            unique_roots.append(root)
+    for filename in ("voices.npz", "voices.pt"):
+        for root in unique_roots:
+            candidate = root / filename
+            if candidate.is_file():
+                return os.path.abspath(candidate)
+
+    if not weights_is_file:
+        remote_filenames = []
+        if requested is not None:
+            remote_filenames.append(requested.name)
+        remote_filenames.extend(["voices.npz", "voices.pt"])
+        for filename in dict.fromkeys(remote_filenames):
+            try:
+                return hf_hub_download(repo_id=weights_path, filename=filename)
+            except Exception:
+                continue
+    return None
 
 
 class VoiceEncoder(nn.Module):
@@ -98,18 +167,25 @@ class VoiceEncoder(nn.Module):
 
 
 class HolosTTS(nn.Module):
-    def __init__(self, weights_path="patriotyk/HolosTTS", device='cuda', onnx_phase_scale=0.0, voices_path="voices.pt"):
+    def __init__(self, weights_path="patriotyk/HolosTTS", device='cuda',
+                 voices_path="voices.npz", harmonic_representation="polar",
+                 onnx_max_frames=1000):
         super().__init__()
         
         self.add_module('text_encoder', TextEncoder())
         self.add_module('prosodic_text_encoder', TextEncoder(n_layers=6, use_pe=True, scale_embedding=False, partial_rope=True, use_conv_pe=True))
         self.add_module('duration_predictor', DurationPredictor(d_hid=512))
         self.add_module('prosodic_predictor', ProsodyPredictor(d_hid=512))
-        self.add_module('decoder', Decoder(onnx_phase_scale=onnx_phase_scale))
+        self.add_module(
+            'decoder',
+            Decoder(harmonic_representation=harmonic_representation),
+        )
         self.to(device)
         self.device = device
+        self.onnx_max_frames = int(onnx_max_frames)
         self.eval()
         self.voices = {}
+        self.voices_path = None
 
         if weights_path is not None:
             resolved_weights_path = None
@@ -121,23 +197,26 @@ class HolosTTS(nn.Module):
             params = torch.load(resolved_weights_path, map_location=device)
             if isinstance(params, dict) and 'vocab' in params:
                 self.tokenizer = Tokenizer(params['vocab'])
-                self.load_state_dict(params['state_dict'], strict=True)
+                state_dict = params['state_dict']
             else:
-                self.load_state_dict(params, strict=True)
+                state_dict = params
+            self.load_state_dict(state_dict, strict=True)
 
-            resolved_voices_path = None
-            if voices_path and os.path.isfile(voices_path):
-                resolved_voices_path = voices_path
-            elif not os.path.isfile(weights_path):
-                try:
-                    resolved_voices_path = hf_hub_download(repo_id=weights_path, filename="voices.pt")
-                except Exception:
-                    resolved_voices_path = None
-
+            resolved_voices_path = _resolve_voices_path(weights_path, voices_path)
             if resolved_voices_path and os.path.isfile(resolved_voices_path):
-                self.voices = torch.load(resolved_voices_path, map_location=device)
+                self.voices = load_voice_embeddings(
+                    resolved_voices_path,
+                    device=device,
+                )
+                self.voices_path = resolved_voices_path
             else:
-                raise FileNotFoundError("Voices file not found")
+                raise FileNotFoundError(
+                    "Voices file not found. Expected canonical voices.npz "
+                    "or legacy voices.pt."
+                )
+
+        _remove_weight_norm(self)
+        _fuse_transformer_projections(self)
 
     def set_onnx_phase_scale(self, value: float):
         self.decoder.generator.stft.set_onnx_phase_scale(value)
@@ -171,8 +250,11 @@ class HolosTTS(nn.Module):
         
         if torch.onnx.is_in_onnx_export():
             # RKNN requires fully static graphs. We must set a fixed maximum audio frame length.
-            # 1000 frames is ~20 seconds of audio. Adjust if you need longer generation.
-            seq_length = torch.tensor(1000, device=pred_dur.device, dtype=torch.long)
+            seq_length = torch.tensor(
+                self.onnx_max_frames,
+                device=pred_dur.device,
+                dtype=torch.long,
+            )
         else:
             seq_length = seq_length_dynamic
 
