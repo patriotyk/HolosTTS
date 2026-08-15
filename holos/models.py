@@ -98,14 +98,14 @@ class VoiceEncoder(nn.Module):
 
 
 class HolosTTS(nn.Module):
-    def __init__(self, weights_path="patriotyk/HolosTTS", device='cuda', onnx_phase_scale=0.0, voices_path="voices.pt"):
+    def __init__(self, weights_path="patriotyk/HolosTTS", device='cuda',  voices_path="voices.pt"):
         super().__init__()
         
         self.add_module('text_encoder', TextEncoder())
         self.add_module('prosodic_text_encoder', TextEncoder(n_layers=6, use_pe=True, scale_embedding=False, partial_rope=True, use_conv_pe=True))
         self.add_module('duration_predictor', DurationPredictor(d_hid=512))
         self.add_module('prosodic_predictor', ProsodyPredictor(d_hid=512))
-        self.add_module('decoder', Decoder(onnx_phase_scale=onnx_phase_scale))
+        self.add_module('decoder', Decoder())
         self.to(device)
         self.device = device
         self.eval()
