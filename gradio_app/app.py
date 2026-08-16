@@ -33,6 +33,7 @@ from holos.models import HolosTTS, VoiceEncoder
 stressify = Stressifier()
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+#device= 'cpu'
 
 model_path = 'holos.pt' if os.path.isfile('holos.pt') else 'patriotyk/HolosTTS'
 ve_path = 'voice_encoder.pt' if os.path.isfile('voice_encoder.pt') else 'patriotyk/HolosTTS'
@@ -42,11 +43,11 @@ voice_encoder = VoiceEncoder(ve_path, device=device)
  
 session = ort.InferenceSession(
     'holos.onnx',
-    providers=["CPUExecutionProvider"],
+    providers=["CUDAExecutionProvider"],
 )
 
-onnx_model = HolosTTSONNX('.')  # CPUExecutionProvider by default
-print(model.list_voices())
+# onnx_model = HolosTTSONNX('.')  # CPUExecutionProvider by default
+# print(onnx_model.list_voices())
 
 
 def to_int16(wav_chunks):
@@ -174,7 +175,7 @@ def synthesize(text, voice_name, custom_voice=None, progress=gr.Progress()):
                     {
                         "tokens": np.asarray([tokens], dtype=np.int64),
                         "voice": onnx_voice,
-                        "input_lengths": np.asarray([len(tokens)], dtype=np.int64),
+                        #"input_lengths": np.asarray([len(tokens)], dtype=np.int64),
                     },
                 )
                 # result = onnx_model.generate_with_details(

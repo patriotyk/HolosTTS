@@ -13,6 +13,16 @@ from .tokenizer import Tokenizer
 
 VoiceInput = Union[str, np.ndarray, Sequence[float]]
 
+_TENSORRT_PROVIDER = "TensorrtExecutionProvider"
+_CUDA_PROVIDER = "CUDAExecutionProvider"
+_CPU_PROVIDER = "CPUExecutionProvider"
+_GPU_PROVIDERS = {_TENSORRT_PROVIDER, _CUDA_PROVIDER}
+_TENSORRT_PROFILE_OPTIONS = (
+    "trt_profile_min_shapes",
+    "trt_profile_opt_shapes",
+    "trt_profile_max_shapes",
+)
+
 
 @dataclass(frozen=True)
 class InferenceResult:
@@ -53,21 +63,60 @@ class HolosTTS:
         self.tokenizer = Tokenizer(self.manifest["vocab"])
         self._voices = self._load_voices(self.manifest.get("voices"))
 
-        selected_providers = list(providers or ["CPUExecutionProvider"])
+        selected_providers = list(providers or [_CPU_PROVIDER])
+        selected_providers = self._add_tensorrt_fallbacks(selected_providers)
+        self._preload_gpu_libraries(selected_providers)
+        self._tensorrt_enabled = any(
+            self._provider_name(value) == _TENSORRT_PROVIDER
+            for value in selected_providers
+        )
+        self.tensorrt_profile = self._load_tensorrt_profile()
+        encoder_providers = self._configure_stage_providers(
+            selected_providers,
+            stage="encoder",
+        )
+        prosody_filename = self.manifest.get("prosody")
+        if prosody_filename is None:
+            prosody_providers = None
+            decoder_providers = self._configure_stage_providers(
+                selected_providers,
+                stage="decoder",
+            )
+        else:
+            prosody_providers = self._configure_stage_providers(
+                selected_providers,
+                stage="prosody",
+            )
+            decoder_providers = self._without_tensorrt(selected_providers)
         self.providers = [self._provider_name(value) for value in selected_providers]
         self.encoder_session = ort.InferenceSession(
             str(self.model_dir / self.manifest["encoder"]),
             sess_options=session_options,
-            providers=selected_providers,
+            providers=encoder_providers,
         )
+        self.encoder_input_names = {
+            value.name
+            for value in self.encoder_session.get_inputs()
+        }
+        self.prosody_session = None
+        if prosody_filename is not None:
+            self.prosody_session = ort.InferenceSession(
+                str(self.model_dir / prosody_filename),
+                sess_options=session_options,
+                providers=prosody_providers,
+            )
         self.decoder_session = ort.InferenceSession(
             str(self.model_dir / self.manifest["decoder"]),
             sess_options=session_options,
-            providers=selected_providers,
+            providers=decoder_providers,
         )
-        get_providers = getattr(self.decoder_session, "get_providers", None)
-        if callable(get_providers):
-            self.providers = list(get_providers())
+        sessions = [self.encoder_session, self.prosody_session, self.decoder_session]
+        self.providers = list(dict.fromkeys(
+            provider
+            for session in sessions
+            if session is not None
+            for provider in session.get_providers()
+        ))
         self.alignment_format = self._resolve_alignment_format()
 
     @staticmethod
@@ -75,6 +124,129 @@ class HolosTTS:
         if isinstance(provider, (tuple, list)):
             return str(provider[0])
         return str(provider)
+
+    @classmethod
+    def _add_tensorrt_fallbacks(cls, providers: List[Any]) -> List[Any]:
+        """Keep unsupported TensorRT nodes on CUDA instead of moving to CPU."""
+        names = [cls._provider_name(value) for value in providers]
+        if _TENSORRT_PROVIDER not in names:
+            return providers
+
+        available = set(ort.get_available_providers())
+        for fallback in (_CUDA_PROVIDER, _CPU_PROVIDER):
+            if fallback in available and fallback not in names:
+                providers.append(fallback)
+                names.append(fallback)
+        return providers
+
+    @classmethod
+    def _without_tensorrt(cls, providers: Sequence[Any]) -> List[Any]:
+        fallbacks = [
+            provider
+            for provider in providers
+            if cls._provider_name(provider) != _TENSORRT_PROVIDER
+        ]
+        return fallbacks or [_CPU_PROVIDER]
+
+    @classmethod
+    def _preload_gpu_libraries(cls, providers: Sequence[Any]) -> None:
+        names = {cls._provider_name(value) for value in providers}
+        if not names.intersection(_GPU_PROVIDERS):
+            return
+
+        preload_dlls = getattr(ort, "preload_dlls", None)
+        if callable(preload_dlls):
+            # An empty directory makes ONNX Runtime prefer NVIDIA pip package
+            # libraries (including nvidia/cu13/lib) over unrelated PyTorch DLLs.
+            preload_dlls(directory="")
+
+    def _load_tensorrt_profile(self) -> Optional[Dict[str, int]]:
+        profile = self.manifest.get("tensorrt_profile")
+        if profile is None:
+            return None
+        if not isinstance(profile, dict):
+            raise ValueError("Manifest tensorrt_profile must be an object")
+
+        required = {
+            "min_text_length",
+            "opt_text_length",
+            "max_text_length",
+            "min_frames",
+            "opt_frames",
+            "max_frames",
+        }
+        missing = sorted(required.difference(profile))
+        if missing:
+            raise ValueError(
+                "Manifest tensorrt_profile is missing fields: "
+                + ", ".join(missing)
+            )
+        values = {name: int(profile[name]) for name in required}
+        for dimension in ("text_length", "frames"):
+            minimum = values[f"min_{dimension}"]
+            optimum = values[f"opt_{dimension}"]
+            maximum = values[f"max_{dimension}"]
+            if not 0 < minimum <= optimum <= maximum:
+                raise ValueError(
+                    f"Invalid TensorRT {dimension} profile: "
+                    f"{minimum} <= {optimum} <= {maximum}"
+                )
+        return values
+
+    def _stage_profile_options(self, stage: str) -> Dict[str, str]:
+        if self.tensorrt_profile is None:
+            return {}
+
+        profile = self.tensorrt_profile
+        shapes = {}
+        for point in ("min", "opt", "max"):
+            text_length = profile[f"{point}_text_length"]
+            if stage == "encoder":
+                shapes[point] = f"tokens:1x{text_length}"
+            elif stage == "prosody":
+                frames = profile[f"{point}_frames"]
+                shapes[point] = (
+                    f"prosodic_tokens:1x{text_length}x512,"
+                    f"frame_to_token:{frames}"
+                )
+            elif stage == "decoder":
+                frames = profile[f"{point}_frames"]
+                shapes[point] = (
+                    f"acoustic_tokens:1x512x{text_length},"
+                    f"prosodic_tokens:1x{text_length}x512,"
+                    f"frame_to_token:{frames}"
+                )
+            else:
+                raise ValueError(f"Unknown ONNX stage: {stage!r}")
+        return {
+            option: shapes[point]
+            for option, point in zip(
+                _TENSORRT_PROFILE_OPTIONS,
+                ("min", "opt", "max"),
+            )
+        }
+
+    def _configure_stage_providers(
+        self,
+        providers: Sequence[Any],
+        stage: str,
+    ) -> List[Any]:
+        profile_options = self._stage_profile_options(stage)
+        configured = []
+        for provider in providers:
+            if self._provider_name(provider) != _TENSORRT_PROVIDER:
+                configured.append(provider)
+                continue
+
+            options = {}
+            if isinstance(provider, (tuple, list)) and len(provider) > 1:
+                options.update(dict(provider[1]))
+            # A bundle has different dynamic inputs in each stage. Always use
+            # its matching profile instead of applying one shared profile to
+            # both TensorRT sessions.
+            options.update(profile_options)
+            configured.append((_TENSORRT_PROVIDER, options))
+        return configured
 
     def _resolve_alignment_format(self) -> str:
         configured = self.manifest.get("alignment_format")
@@ -195,6 +367,14 @@ class HolosTTS:
                 f"Predicted {frame_count} frames, exceeding "
                 f"max_frames={self.max_frames}"
             )
+        if self._tensorrt_enabled and self.tensorrt_profile is not None:
+            minimum = self.tensorrt_profile["min_frames"]
+            maximum = self.tensorrt_profile["max_frames"]
+            if not minimum <= frame_count <= maximum:
+                raise ValueError(
+                    f"Predicted {frame_count} frames outside the TensorRT "
+                    f"profile range [{minimum}, {maximum}]"
+                )
 
     @staticmethod
     def _build_frame_to_token(
@@ -221,26 +401,56 @@ class HolosTTS:
     ) -> InferenceResult:
         token_values = self.tokenizer.encode_with_boundaries(text)
         tokens = np.ascontiguousarray(token_values[None, :])
+        if self._tensorrt_enabled and self.tensorrt_profile is not None:
+            text_length = tokens.shape[1]
+            minimum = self.tensorrt_profile["min_text_length"]
+            maximum = self.tensorrt_profile["max_text_length"]
+            if not minimum <= text_length <= maximum:
+                raise ValueError(
+                    f"Token length {text_length} is outside the TensorRT "
+                    f"profile range [{minimum}, {maximum}]"
+                )
         input_lengths = np.asarray([tokens.shape[1]], dtype=np.int64)
         voice_array = self._voice_array(voice)
 
+        encoder_inputs = {
+            "tokens": tokens,
+            "voice": voice_array,
+        }
+        if "input_lengths" in self.encoder_input_names:
+            encoder_inputs["input_lengths"] = input_lengths
         acoustic_tokens, prosodic_tokens, durations = self.encoder_session.run(
             ["acoustic_tokens", "prosodic_tokens", "durations"],
-            {
-                "tokens": tokens,
-                "voice": voice_array,
-                "input_lengths": input_lengths,
-            },
+            encoder_inputs,
         )
         durations = np.asarray(durations, dtype=np.int64)
         frame_count = int(durations.sum())
         self._validate_frame_count(frame_count)
+        frame_to_token = self._build_frame_to_token(durations)
         decoder_inputs = {
             "acoustic_tokens": np.asarray(acoustic_tokens, dtype=np.float32),
-            "prosodic_tokens": np.asarray(prosodic_tokens, dtype=np.float32),
             "voice": voice_array,
-            "frame_to_token": self._build_frame_to_token(durations),
+            "frame_to_token": frame_to_token,
         }
+        if self.prosody_session is None:
+            decoder_inputs["prosodic_tokens"] = np.asarray(
+                prosodic_tokens,
+                dtype=np.float32,
+            )
+        else:
+            f0, energy = self.prosody_session.run(
+                ["f0", "energy"],
+                {
+                    "prosodic_tokens": np.asarray(
+                        prosodic_tokens,
+                        dtype=np.float32,
+                    ),
+                    "frame_to_token": frame_to_token,
+                    "voice": voice_array,
+                },
+            )
+            decoder_inputs["f0"] = np.asarray(f0, dtype=np.float32)
+            decoder_inputs["energy"] = np.asarray(energy, dtype=np.float32)
 
         audio, audio_lengths = self.decoder_session.run(
             ["audio", "audio_lengths"],

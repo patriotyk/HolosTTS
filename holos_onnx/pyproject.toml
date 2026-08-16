@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.24",
-    "onnxruntime>=1.18",
+    "onnxruntime-gpu>=1.18",
 ]
 
 [tool.setuptools.packages.find]

@@ -454,6 +454,7 @@ class EncoderLayerONNX(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+        self.onnx_attention_format = "ort_multi_head_attention"
 
     @staticmethod
     def _fuse_linears(linears):
@@ -534,18 +535,38 @@ class EncoderLayerONNX(nn.Module):
         if torch.onnx.is_in_onnx_export():
             if self.training:
                 raise RuntimeError("Fused ONNX Attention export requires eval mode")
-            query = self._combine_heads(q)
-            context = (
-                _OnnxRuntimeAttention.apply(query, k, v, self.nhead)
-                if src_key_padding_mask is None
-                else _OnnxRuntimeMaskedAttention.apply(
-                    query,
-                    k,
-                    v,
-                    (~src_key_padding_mask).to(torch.int32),
-                    self.nhead,
+            if self.onnx_attention_format == "tensorrt_fused_attention":
+                # TensorRT recognizes this scaled BMM -> Softmax -> BMM
+                # pattern and keeps it inside a fused attention subgraph.
+                scores = torch.matmul(
+                    q * (self.head_dim ** -0.5),
+                    k.transpose(-2, -1),
                 )
-            )
+                if src_key_padding_mask is not None:
+                    scores = scores.masked_fill(
+                        src_key_padding_mask.unsqueeze(1).unsqueeze(2),
+                        float("-inf"),
+                    )
+                context = torch.matmul(torch.softmax(scores, dim=-1), v)
+                context = self._combine_heads(context)
+            elif self.onnx_attention_format == "ort_multi_head_attention":
+                query = self._combine_heads(q)
+                context = (
+                    _OnnxRuntimeAttention.apply(query, k, v, self.nhead)
+                    if src_key_padding_mask is None
+                    else _OnnxRuntimeMaskedAttention.apply(
+                        query,
+                        k,
+                        v,
+                        (~src_key_padding_mask).to(torch.int32),
+                        self.nhead,
+                    )
+                )
+            else:
+                raise ValueError(
+                    "Unsupported ONNX attention format: "
+                    f"{self.onnx_attention_format!r}"
+                )
         else:
             attn_mask = None
             if src_key_padding_mask is not None:
@@ -645,10 +666,13 @@ class TextEncoder(nn.Module):
             x_conv = c(x_conv)
             x_conv = x_conv * (1-mask_for_cnn)
             
-        x = x_conv.transpose(1, 2)  # [B, T, C]
-
         if self.conv_pe is not None:
-            x = x + self.conv_pe(x)
+            # Keep the residual and depthwise-convolution branches in the same
+            # layout. This avoids an inverse-Transpose fan-out that TensorRT
+            # can incorrectly fold for a dynamic text width.
+            x_conv = x_conv + self.conv_pe.forward_channels_first(x_conv)
+
+        x = x_conv.transpose(1, 2)  # [B, T, C]
 
         for layer in self.layers:
             x = layer(x, src_key_padding_mask=src_key_padding_mask, rope=self.rope)
@@ -656,6 +680,24 @@ class TextEncoder(nn.Module):
         x = x * (~m).unsqueeze(-1).to(x.dtype)
         x = x.transpose(2, 1)
         return x
+
+    def inference(self, x):
+        """Encode an exact-length batch without constructing padding masks."""
+        x = self.embedding(x)
+        if self.scale_embedding:
+            x = x * math.sqrt(self.channels)
+
+        x = x.transpose(1, 2)
+        for convolution in self.cnn:
+            x = convolution(x)
+
+        if self.conv_pe is not None:
+            x = x + self.conv_pe.forward_channels_first(x)
+
+        x = x.transpose(1, 2)
+        for layer in self.layers:
+            x = layer(x, src_key_padding_mask=None, rope=self.rope)
+        return x.transpose(2, 1)
 
 
 class AttentivePooling(nn.Module):
@@ -805,13 +847,16 @@ class MultiScaleConvPE(nn.Module):
 
     def forward(self, x):
         """x: [B, T, D] → returns positional encoding [B, T, D] to add to x."""
-        xt = x.transpose(1, 2)  # [B, D, T]
+        return self.forward_channels_first(x.transpose(1, 2)).transpose(1, 2)
+
+    def forward_channels_first(self, x):
+        """x: [B, D, T] → returns positional encoding [B, D, T]."""
         # Stack conv outputs: [num_scales, B, D, T]
-        multi = torch.stack([conv(xt) for conv in self.convs], dim=0)
+        multi = torch.stack([conv(x) for conv in self.convs], dim=0)
         # Gated sum: softmax over scales, then weighted sum
         weights = torch.softmax(self.gate, dim=0)  # [num_scales, 1, D, 1]
         pe = (multi * weights).sum(dim=0)  # [B, D, T]
-        return pe.transpose(1, 2)  # [B, T, D]
+        return pe
 
 
 class DurationPredictor(nn.Module):
@@ -876,6 +921,18 @@ class DurationPredictor(nn.Module):
         x = F.dropout(x, p=self.dropout_dur, training=self.training)
         dur = self.proj(x)                # [B, T, max_dur]
         return dur
+
+    def inference(self, x, style):
+        """Predict durations for exact-length tokens without padding masks."""
+        x = self.film(x, style)
+        x = x + self.conv_pe(x)
+
+        for layer, film_layer in zip(self.layers, self.films):
+            x = film_layer(x, style)
+            x = layer(x, src_key_padding_mask=None, rope=self.rope)
+
+        x = F.dropout(x, p=self.dropout_dur, training=self.training)
+        return self.proj(x)
 
 
 class ProsodyPredictor(nn.Module):

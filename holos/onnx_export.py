@@ -42,20 +42,19 @@ class OnnxDurationEncoderWrapper(nn.Module):
         self.text_encoder = model.text_encoder
         self.duration_predictor = model.duration_predictor
 
-    def forward(self, tokens, voice, input_lengths):
+    def forward(self, tokens, voice):
         voice_prosodic = voice[:, 128:]
 
-        prosodic_encoded = self.prosodic_text_encoder(tokens, input_lengths)
+        prosodic_encoded = self.prosodic_text_encoder.inference(tokens)
         prosodic_tokens = prosodic_encoded.transpose(1, 2)
-        duration_logits = self.duration_predictor(
+        duration_logits = self.duration_predictor.inference(
             prosodic_tokens,
             voice_prosodic,
-            input_lengths,
         )
         durations = torch.round(torch.sigmoid(duration_logits).sum(dim=-1))
         durations = durations.clamp(min=1).to(torch.int64)
 
-        acoustic_tokens = self.text_encoder(tokens, input_lengths)
+        acoustic_tokens = self.text_encoder.inference(tokens)
         return acoustic_tokens, prosodic_tokens, durations
 
 
@@ -107,8 +106,66 @@ class OnnxAcousticDecoderWrapper(nn.Module):
         return torch.index_select(token_features, 2, frame_to_token)
 
 
+class OnnxProsodyDecoderWrapper(nn.Module):
+    """Stage 2: aligned prosody tokens -> frame-level F0 and energy."""
+
+    def __init__(self, model: HolosTTS):
+        super().__init__()
+        self.prosodic_predictor = model.prosodic_predictor
+
+    def forward(self, prosodic_tokens, frame_to_token, voice):
+        aligned_prosody = torch.index_select(
+            prosodic_tokens.transpose(1, 2),
+            2,
+            frame_to_token,
+        )
+        return self.prosodic_predictor.inference(
+            aligned_prosody,
+            voice[:, 128:],
+        )
+
+
+class OnnxWaveformDecoderWrapper(nn.Module):
+    """Stage 3: acoustic features and prosody -> waveform."""
+
+    def __init__(self, model: HolosTTS):
+        super().__init__()
+        self.decoder = model.decoder
+        self.samples_per_frame = int(
+            model.decoder.generator.total_upsample * 2
+        )
+
+    def forward(
+        self,
+        acoustic_tokens,
+        frame_to_token,
+        f0,
+        energy,
+        voice,
+    ):
+        aligned_acoustic = torch.index_select(
+            acoustic_tokens,
+            2,
+            frame_to_token,
+        )
+        audio = self.decoder.inference(
+            aligned_acoustic,
+            f0,
+            energy,
+            voice[:, :128],
+        ).squeeze(1)
+        audio_lengths = torch._shape_as_tensor(audio)[-1:].to(torch.int64)
+        return audio, audio_lengths
+
+
 class OnnxDynamicInferenceWrapper(nn.Module):
-    """Single graph with data-dependent alignment and waveform length."""
+    """Single graph with data-dependent alignment and waveform length.
+
+    Dynamic inference operates on one exact-length, unpadded token sequence, so
+    it deliberately has no ``input_lengths`` input.  Keeping an unused third
+    argument would make the Python export signature disagree with the ONNX
+    graph after dead-input elimination.
+    """
 
     def __init__(self, model: HolosTTS, max_frames: int):
         super().__init__()
@@ -116,21 +173,28 @@ class OnnxDynamicInferenceWrapper(nn.Module):
         self.acoustic_decoder = OnnxAcousticDecoderWrapper(model)
         self.max_frames = int(max_frames)
 
-    def forward(self, tokens, voice, input_lengths):
+    def forward(self, tokens, voice):
         acoustic_tokens, prosodic_tokens, durations = self.duration_encoder(
             tokens,
             voice,
-            input_lengths,
         )
         frame_lengths = durations.sum(dim=1).clamp(max=self.max_frames)
 
-        token_ids = torch.arange(
-            durations.size(1),
+        frame_positions = torch.arange(
+            frame_lengths[0],
             device=durations.device,
             dtype=torch.int64,
         )
-        frame_to_token = torch.repeat_interleave(token_ids, durations[0])
-        frame_to_token = frame_to_token[:frame_lengths[0]]
+        # ``repeat_interleave`` exports as SplitToSequence + Loop, which is
+        # expensive on CPU and poorly supported by mobile execution providers.
+        # A frame belongs to the number of tokens whose end position is not
+        # greater than that frame.  This vectorized form exports as Range,
+        # CumSum, comparison and ReduceSum only.
+        token_end_positions = torch.cumsum(durations[0], dim=0)[:-1]
+        frame_to_token = torch.sum(
+            frame_positions[:, None] >= token_end_positions[None, :],
+            dim=1,
+        ).to(torch.int64)
 
         return self.acoustic_decoder(
             acoustic_tokens,
@@ -229,6 +293,17 @@ def _expected_attention_nodes(module: nn.Module) -> int:
     )
 
 
+def _set_attention_format(module: nn.Module, attention_format: str) -> int:
+    layers = [
+        child
+        for child in module.modules()
+        if isinstance(child, EncoderLayerONNX)
+    ]
+    for layer in layers:
+        layer.onnx_attention_format = attention_format
+    return len(layers)
+
+
 def _check_fused_attention(onnx_model, expected: int, path: Path) -> int:
     actual = sum(
         node.domain == "com.microsoft"
@@ -240,6 +315,62 @@ def _check_fused_attention(onnx_model, expected: int, path: Path) -> int:
             f"Fused attention validation failed for {path}: "
             f"expected {expected} ONNX Runtime MultiHeadAttention nodes, "
             f"found {actual}"
+        )
+    return actual
+
+
+def _check_tensorrt_attention(onnx_model, expected: int, path: Path) -> int:
+    """Validate TensorRT's recognizable BMM -> mask -> Softmax -> BMM pattern."""
+    nodes = list(onnx_model.graph.node)
+    producer = {
+        output: node
+        for node in nodes
+        for output in node.output
+        if output
+    }
+    consumers = {}
+    for node in nodes:
+        for value in node.input:
+            consumers.setdefault(value, []).append(node)
+
+    def has_upstream_matmul(node, depth: int = 6) -> bool:
+        if depth < 0:
+            return False
+        parents = [producer.get(value) for value in node.input]
+        return any(
+            parent is not None
+            and (
+                parent.op_type == "MatMul"
+                or has_upstream_matmul(parent, depth - 1)
+            )
+            for parent in parents
+        )
+
+    forbidden = [
+        node.name or node.op_type
+        for node in nodes
+        if node.op_type == "Attention"
+        or (
+            node.domain == "com.microsoft"
+            and node.op_type == "MultiHeadAttention"
+        )
+    ]
+    softmax_nodes = [node for node in nodes if node.op_type == "Softmax"]
+    invalid = [
+        node.name or node.output[0]
+        for node in softmax_nodes
+        if not has_upstream_matmul(node)
+        or not any(
+            consumer.op_type == "MatMul"
+            for consumer in consumers.get(node.output[0], ())
+        )
+    ]
+    actual = len(softmax_nodes)
+    if actual != expected or invalid or forbidden:
+        raise RuntimeError(
+            f"TensorRT attention validation failed for {path}: "
+            f"expected {expected} BMM/mask/Softmax/BMM patterns, found {actual}; "
+            f"invalid={invalid}, unsupported attention nodes={forbidden}"
         )
     return actual
 
@@ -265,14 +396,14 @@ def _check_fused_projections(onnx_model, expected, path: Path):
         for node in onnx_model.graph.node
         if node.op_type in {"Gemm", "MatMul"}
     ]
-    qkv = sum("/qkv_proj/" in node.name for node in projection_nodes)
-    gate_up = sum("/gate_up_proj/" in node.name for node in projection_nodes)
+    qkv = sum("/qkv_proj" in node.name for node in projection_nodes)
+    gate_up = sum("/gate_up_proj" in node.name for node in projection_nodes)
     old_projection_names = (
-        "/q_proj/",
-        "/k_proj/",
-        "/v_proj/",
-        "/gate_proj/",
-        "/up_proj/",
+        "/q_proj",
+        "/k_proj",
+        "/v_proj",
+        "/gate_proj",
+        "/up_proj",
     )
     old_nodes = [
         node.name
@@ -321,6 +452,78 @@ def _check_instance_norm(onnx_model, expected: int, path: Path) -> int:
     return actual
 
 
+def _infer_symbolic_shapes(onnx_model, path: Path):
+    """Add the intermediate tensor shapes required by TensorRT partitioning."""
+    try:
+        from onnxruntime.tools.symbolic_shape_infer import (
+            SymbolicShapeInference,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "TensorRT-compatible bundle export requires ONNX Runtime; "
+            "install ONNX dependencies with: pip install -e '.[onnx]'"
+        ) from error
+
+    inferred_model = SymbolicShapeInference.infer_shapes(
+        onnx_model,
+        auto_merge=True,
+        guess_output_rank=True,
+        verbose=0,
+    )
+    if inferred_model is None:
+        raise RuntimeError(f"Symbolic shape inference failed for {path}")
+
+    _make_intermediate_symbolic_dims_unique(inferred_model)
+    return inferred_model
+
+
+def _make_intermediate_symbolic_dims_unique(onnx_model) -> None:
+    """Discard unsafe equality guesses made while auto-merging dynamic dims.
+
+    Symbolic shape inference must auto-merge some expressions to finish the
+    decoder graph. Those inferred equalities are only hints, and convolution
+    rounding can make two of them differ by one at runtime. Unique symbolic
+    names retain rank metadata for TensorRT without misleading ORT's memory
+    planner.
+    """
+    for value_index, value in enumerate(onnx_model.graph.value_info):
+        tensor_type = value.type.tensor_type
+        if not tensor_type.HasField("shape"):
+            continue
+        for axis, dimension in enumerate(tensor_type.shape.dim):
+            if dimension.HasField("dim_param"):
+                dimension.dim_param = f"holos_dim_{value_index}_{axis}"
+
+
+def _check_complete_tensor_shapes(onnx_model, path: Path) -> int:
+    """Ensure every produced tensor has type/shape metadata for TensorRT."""
+    shaped_values = {
+        value.name
+        for value in (
+            *onnx_model.graph.input,
+            *onnx_model.graph.value_info,
+            *onnx_model.graph.output,
+        )
+        if value.type.HasField("tensor_type")
+        and value.type.tensor_type.HasField("shape")
+    }
+    missing = sorted(
+        output
+        for node in onnx_model.graph.node
+        for output in node.output
+        if output and output not in shaped_values
+    )
+    if missing:
+        preview = ", ".join(missing[:5])
+        suffix = "..." if len(missing) > 5 else ""
+        raise RuntimeError(
+            f"TensorRT shape validation failed for {path}: "
+            f"{len(missing)} node outputs have no inferred shape "
+            f"({preview}{suffix})"
+        )
+    return len(shaped_values)
+
+
 def export_onnx(
     output: Path,
     weights: str = "patriotyk/HolosTTS",
@@ -367,11 +570,17 @@ def export_onnx(
     tokens = _dummy_tokens(model, sequence_length, device)
     voice = _load_voice_tensor(model, voice_name, voice_tensor_path, device)
     input_lengths = torch.tensor([sequence_length], dtype=torch.int64, device=device)
-    wrapper = (
-        OnnxDynamicInferenceWrapper(model, max_frames=max_frames)
-        if dynamic_frames
-        else OnnxInferenceWrapper(model)
-    ).eval()
+    if dynamic_frames:
+        wrapper = OnnxDynamicInferenceWrapper(
+            model,
+            max_frames=max_frames,
+        ).eval()
+        export_args = (tokens, voice)
+        input_names = ["tokens", "voice"]
+    else:
+        wrapper = OnnxInferenceWrapper(model).eval()
+        export_args = (tokens, voice, input_lengths)
+        input_names = ["tokens", "voice", "input_lengths"]
 
     dynamic_axes = {}
     if dynamic_text:
@@ -381,7 +590,7 @@ def export_onnx(
 
     export_kwargs = {
         "export_params": True,
-        "input_names": ["tokens", "voice", "input_lengths"],
+        "input_names": input_names,
         "output_names": ["audio", "audio_lengths"],
         "opset_version": opset,
         "do_constant_folding": True,
@@ -400,7 +609,7 @@ def export_onnx(
     with torch.inference_mode():
         torch.onnx.export(
             wrapper,
-            (tokens, voice, input_lengths),
+            export_args,
             str(output),
             **export_kwargs,
         )
@@ -445,14 +654,13 @@ def export_onnx(
 
         print("Running one ONNX Runtime smoke test...")
         session = ort.InferenceSession(str(output), providers=["CPUExecutionProvider"])
-        audio, audio_lengths = session.run(
-            None,
-            {
-                "tokens": tokens.cpu().numpy(),
-                "voice": voice.cpu().numpy(),
-                "input_lengths": input_lengths.cpu().numpy(),
-            },
-        )
+        runtime_inputs = {
+            "tokens": tokens.cpu().numpy(),
+            "voice": voice.cpu().numpy(),
+        }
+        if not dynamic_frames:
+            runtime_inputs["input_lengths"] = input_lengths.cpu().numpy()
+        audio, audio_lengths = session.run(None, runtime_inputs)
         if not np.isfinite(audio).all():
             raise RuntimeError("ONNX Runtime produced non-finite audio")
         valid_length = int(audio_lengths[0])
@@ -489,6 +697,7 @@ def export_onnx_bundle(
     sequence_length: int = 16,
     max_frames: int = 1000,
     harmonic_representation: str = "polar",
+    attention_backend: str = "tensorrt",
     verify_runtime: bool = False,
     force: bool = False,
 ):
@@ -502,15 +711,26 @@ def export_onnx_bundle(
         raise ValueError("max_frames must be positive")
     if opset < 18:
         raise ValueError("opset must be at least 18")
+    attention_formats = {
+        "tensorrt": "tensorrt_fused_attention",
+        "onnxruntime": "ort_multi_head_attention",
+    }
+    try:
+        attention_format = attention_formats[attention_backend]
+    except KeyError as error:
+        raise ValueError(
+            "attention_backend must be 'tensorrt' or 'onnxruntime'"
+        ) from error
 
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     encoder_path = output_dir / "encoder.onnx"
+    prosody_path = output_dir / "prosody.onnx"
     decoder_path = output_dir / "decoder.onnx"
     voices_path = output_dir / "voices.npz"
     manifest_path = output_dir / "holos_onnx.json"
     _check_output_targets(
-        [encoder_path, decoder_path, voices_path, manifest_path],
+        [encoder_path, prosody_path, decoder_path, voices_path, manifest_path],
         force=force,
     )
 
@@ -526,21 +746,26 @@ def export_onnx_bundle(
 
     tokens = _dummy_tokens(model, sequence_length, device)
     voice = _load_voice_tensor(model, voice_name, voice_tensor_path, device)
-    input_lengths = torch.tensor(
-        [sequence_length],
-        dtype=torch.int64,
-        device=device,
-    )
     encoder = OnnxDurationEncoderWrapper(model).eval()
-    decoder = OnnxAcousticDecoderWrapper(model).eval()
+    prosody = OnnxProsodyDecoderWrapper(model).eval()
+    decoder = OnnxWaveformDecoderWrapper(model).eval()
+    encoder_attention_layers = _set_attention_format(
+        encoder,
+        attention_format,
+    )
+    prosody_attention_layers = _set_attention_format(
+        prosody,
+        attention_format,
+    )
 
     export_common = {
         "export_params": True,
         "opset_version": opset,
         "do_constant_folding": True,
         "training": torch.onnx.TrainingMode.EVAL,
-        "custom_opsets": {"com.microsoft": 1},
     }
+    if attention_backend == "onnxruntime":
+        export_common["custom_opsets"] = {"com.microsoft": 1}
     if "dynamo" in inspect.signature(torch.onnx.export).parameters:
         export_common["dynamo"] = False
 
@@ -548,9 +773,9 @@ def export_onnx_bundle(
     with torch.inference_mode():
         torch.onnx.export(
             encoder,
-            (tokens, voice, input_lengths),
+            (tokens, voice),
             str(encoder_path),
-            input_names=["tokens", "voice", "input_lengths"],
+            input_names=["tokens", "voice"],
             output_names=[
                 "acoustic_tokens",
                 "prosodic_tokens",
@@ -568,13 +793,41 @@ def export_onnx_bundle(
         acoustic_tokens, prosodic_tokens, durations = encoder(
             tokens,
             voice,
-            input_lengths,
         )
         frame_count = int(durations.sum().item())
         frame_to_token = _frame_to_token_tensor(durations)
 
     print(
-        f"Exporting dynamic acoustic/decoder stage to {decoder_path} "
+        f"Exporting dynamic prosody stage to {prosody_path} "
+        f"(example width {frame_count})..."
+    )
+    with torch.inference_mode():
+        torch.onnx.export(
+            prosody,
+            (
+                prosodic_tokens,
+                frame_to_token,
+                voice,
+            ),
+            str(prosody_path),
+            input_names=[
+                "prosodic_tokens",
+                "frame_to_token",
+                "voice",
+            ],
+            output_names=["f0", "energy"],
+            dynamic_axes={
+                "prosodic_tokens": {1: "text_length"},
+                "frame_to_token": {0: "frames"},
+                "f0": {1: "prosody_frames"},
+                "energy": {1: "prosody_frames"},
+            },
+            **export_common,
+        )
+        f0, energy = prosody(prosodic_tokens, frame_to_token, voice)
+
+    print(
+        f"Exporting dynamic waveform stage to {decoder_path} "
         f"(example width {frame_count})..."
     )
     with torch.inference_mode():
@@ -582,40 +835,76 @@ def export_onnx_bundle(
             decoder,
             (
                 acoustic_tokens,
-                prosodic_tokens,
                 frame_to_token,
+                f0,
+                energy,
                 voice,
             ),
             str(decoder_path),
             input_names=[
                 "acoustic_tokens",
-                "prosodic_tokens",
                 "frame_to_token",
+                "f0",
+                "energy",
                 "voice",
             ],
             output_names=["audio", "audio_lengths"],
             dynamic_axes={
                 "acoustic_tokens": {2: "text_length"},
-                "prosodic_tokens": {1: "text_length"},
                 "frame_to_token": {0: "frames"},
+                "f0": {1: "prosody_frames"},
+                "energy": {1: "prosody_frames"},
                 "audio": {1: "audio_samples"},
             },
             **export_common,
         )
 
-    print("Checking split ONNX graphs...")
-    onnx.checker.check_model(str(encoder_path))
-    onnx.checker.check_model(str(decoder_path))
     encoder_model = onnx.load(str(encoder_path), load_external_data=False)
-    encoder_attention_nodes = _check_fused_attention(
+    prosody_model = onnx.load(str(prosody_path), load_external_data=False)
+    decoder_model = onnx.load(str(decoder_path), load_external_data=False)
+
+    print("Inferring symbolic tensor shapes for TensorRT...")
+    encoder_model = _infer_symbolic_shapes(encoder_model, encoder_path)
+    prosody_model = _infer_symbolic_shapes(prosody_model, prosody_path)
+    decoder_model = _infer_symbolic_shapes(decoder_model, decoder_path)
+    onnx.save_model(encoder_model, str(encoder_path))
+    onnx.save_model(prosody_model, str(prosody_path))
+    onnx.save_model(decoder_model, str(decoder_path))
+
+    print("Checking split ONNX graphs...")
+    onnx.checker.check_model(encoder_model)
+    onnx.checker.check_model(prosody_model)
+    onnx.checker.check_model(decoder_model)
+    encoder_shaped_values = _check_complete_tensor_shapes(
         encoder_model,
-        expected=_expected_attention_nodes(encoder),
+        encoder_path,
+    )
+    prosody_shaped_values = _check_complete_tensor_shapes(
+        prosody_model,
+        prosody_path,
+    )
+    decoder_shaped_values = _check_complete_tensor_shapes(
+        decoder_model,
+        decoder_path,
+    )
+    attention_check = (
+        _check_tensorrt_attention
+        if attention_backend == "tensorrt"
+        else _check_fused_attention
+    )
+    encoder_attention_nodes = attention_check(
+        encoder_model,
+        expected=encoder_attention_layers,
         path=encoder_path,
     )
-    decoder_model = onnx.load(str(decoder_path), load_external_data=False)
-    decoder_attention_nodes = _check_fused_attention(
+    prosody_attention_nodes = attention_check(
+        prosody_model,
+        expected=prosody_attention_layers,
+        path=prosody_path,
+    )
+    decoder_attention_nodes = attention_check(
         decoder_model,
-        expected=_expected_attention_nodes(decoder),
+        expected=0,
         path=decoder_path,
     )
     encoder_projection_nodes = _check_fused_projections(
@@ -623,10 +912,20 @@ def export_onnx_bundle(
         expected=_expected_fused_projections(encoder),
         path=encoder_path,
     )
+    prosody_projection_nodes = _check_fused_projections(
+        prosody_model,
+        expected=_expected_fused_projections(prosody),
+        path=prosody_path,
+    )
     decoder_projection_nodes = _check_fused_projections(
         decoder_model,
         expected=_expected_fused_projections(decoder),
         path=decoder_path,
+    )
+    prosody_instance_norm_nodes = _check_instance_norm(
+        prosody_model,
+        expected=_expected_instance_norm_nodes(prosody),
+        path=prosody_path,
     )
     decoder_instance_norm_nodes = _check_instance_norm(
         decoder_model,
@@ -634,17 +933,25 @@ def export_onnx_bundle(
         path=decoder_path,
     )
     print(
-        "Fused ONNX Runtime MultiHeadAttention nodes: "
-        f"encoder={encoder_attention_nodes}, decoder={decoder_attention_nodes}"
+        f"{attention_backend} attention nodes/patterns: "
+        f"encoder={encoder_attention_nodes}, prosody={prosody_attention_nodes}, "
+        f"decoder={decoder_attention_nodes}"
     )
     print(
         "Fused projection nodes (qkv/gate_up): "
         f"encoder={encoder_projection_nodes}, "
+        f"prosody={prosody_projection_nodes}, "
         f"decoder={decoder_projection_nodes}"
     )
     print(
         "Mask-free ONNX InstanceNormalization nodes: "
+        f"prosody={prosody_instance_norm_nodes}, "
         f"decoder={decoder_instance_norm_nodes}"
+    )
+    print(
+        "TensorRT shape metadata values: "
+        f"encoder={encoder_shaped_values}, prosody={prosody_shaped_values}, "
+        f"decoder={decoder_shaped_values}"
     )
 
     exported_voices = _export_voices(model, voices_path)
@@ -655,6 +962,7 @@ def export_onnx_bundle(
         "format": "holos-onnx",
         "format_version": 2,
         "encoder": encoder_path.name,
+        "prosody": prosody_path.name,
         "decoder": decoder_path.name,
         "voices": exported_voices,
         "vocab": list(model.tokenizer.vocab),
@@ -664,8 +972,21 @@ def export_onnx_bundle(
         "decoder_mode": "exact",
         "alignment_format": "gather",
         "normalization_format": "instance_norm",
-        "attention_format": "ort_multi_head_attention",
+        "attention_format": (
+            "tensorrt_fused_bmm"
+            if attention_backend == "tensorrt"
+            else "ort_multi_head_attention"
+        ),
         "projection_format": "fused_qkv_swiglu",
+        "shape_inference_format": "onnxruntime_symbolic",
+        "tensorrt_profile": {
+            "min_text_length": 2,
+            "opt_text_length": max(128, sequence_length),
+            "max_text_length": max(512, sequence_length),
+            "min_frames": min(2, max_frames),
+            "opt_frames": min(256, max_frames),
+            "max_frames": max_frames,
+        },
         "harmonic_representation": harmonic_representation,
     }
     manifest_path.write_text(
@@ -689,7 +1010,6 @@ def export_onnx_bundle(
             {
                 "tokens": tokens.cpu().numpy(),
                 "voice": voice.cpu().numpy(),
-                "input_lengths": input_lengths.cpu().numpy(),
             },
         )
         np.testing.assert_allclose(
@@ -706,17 +1026,43 @@ def export_onnx_bundle(
         )
         np.testing.assert_array_equal(encoded[2], durations.cpu().numpy())
 
+        prosody_session = ort.InferenceSession(
+            str(prosody_path),
+            providers=["CPUExecutionProvider"],
+        )
+        runtime_frame_to_token = _frame_to_token_tensor(durations).cpu().numpy()
+        runtime_f0, runtime_energy = prosody_session.run(
+            None,
+            {
+                "prosodic_tokens": encoded[1],
+                "frame_to_token": runtime_frame_to_token,
+                "voice": voice.cpu().numpy(),
+            },
+        )
+        np.testing.assert_allclose(
+            runtime_f0,
+            f0.cpu().numpy(),
+            atol=2e-5,
+            rtol=2e-4,
+        )
+        np.testing.assert_allclose(
+            runtime_energy,
+            energy.cpu().numpy(),
+            atol=2e-5,
+            rtol=2e-4,
+        )
+
         decoder_session = ort.InferenceSession(
             str(decoder_path),
             providers=["CPUExecutionProvider"],
         )
-        runtime_frame_to_token = _frame_to_token_tensor(durations).cpu().numpy()
         audio, audio_lengths = decoder_session.run(
             None,
             {
                 "acoustic_tokens": encoded[0],
-                "prosodic_tokens": encoded[1],
                 "frame_to_token": runtime_frame_to_token,
+                "f0": runtime_f0,
+                "energy": runtime_energy,
                 "voice": voice.cpu().numpy(),
             },
         )
@@ -739,7 +1085,7 @@ def export_onnx_bundle(
 
     size_mib = sum(
         path.stat().st_size
-        for path in (encoder_path, decoder_path)
+        for path in (encoder_path, prosody_path, decoder_path)
     ) / (1024 * 1024)
     print(f"Bundle export complete: {output_dir} ({size_mib:.1f} MiB of ONNX)")
     return output_dir
@@ -751,12 +1097,15 @@ def build_parser():
     output_group.add_argument(
         "--output",
         type=Path,
-        help="Export the legacy single-file graph",
+        help=(
+            "Export one self-contained graph; combine with --dynamic-frames "
+            "for CPU and mobile runtimes"
+        ),
     )
     output_group.add_argument(
         "--bundle-dir",
         type=Path,
-        help="Export the two-stage bundle used by the torch-free holos-onnx package",
+        help="Export the multi-stage bundle used by the torch-free holos-onnx package",
     )
     parser.add_argument("--weights", default="patriotyk/HolosTTS")
     parser.add_argument("--voices", default="voices.npz")
@@ -773,6 +1122,12 @@ def build_parser():
         help="Use polar for existing checkpoints and cartesian for retrained decoders",
     )
     parser.add_argument(
+        "--attention-backend",
+        choices=("tensorrt", "onnxruntime"),
+        default="tensorrt",
+        help="Export TensorRT BMM attention or ONNX Runtime contrib MHA",
+    )
+    parser.add_argument(
         "--static-text",
         action="store_true",
         help="Keep the dummy token length static (useful for RKNN)",
@@ -782,7 +1137,8 @@ def build_parser():
         action="store_true",
         help=(
             "Use an exact data-dependent waveform length in single-file "
-            "--output mode"
+            "--output mode (recommended for CPU/mobile; omit for fixed-capacity "
+            "RKNN-style graphs)"
         ),
     )
     parser.add_argument("--verify-runtime", action="store_true")
@@ -814,6 +1170,7 @@ def main(argv: Optional[Sequence[str]] = None):
             )
         export_onnx_bundle(
             output_dir=args.bundle_dir,
+            attention_backend=args.attention_backend,
             **common,
         )
         return
