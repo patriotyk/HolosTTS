@@ -98,11 +98,11 @@ class VoiceEncoder(nn.Module):
 
 
 class HolosTTS(nn.Module):
-    def __init__(self, weights_path="patriotyk/HolosTTS", device='cuda',  voices_path="voices.pt"):
+    def __init__(self, weights_path="patriotyk/HolosTTS", device='cuda', voices_path="voices.pt"):
         super().__init__()
         
-        self.add_module('text_encoder', TextEncoder())
-        self.add_module('prosodic_text_encoder', TextEncoder(n_layers=6, use_pe=True, scale_embedding=False, partial_rope=True, use_conv_pe=True))
+        self.add_module('text_encoder', TextEncoder(use_pe=True, partial_rope=True, use_conv_pe=False))
+        self.add_module('prosodic_text_encoder', TextEncoder(n_layers=6, use_pe=True, partial_rope=True, use_conv_pe=True))
         self.add_module('duration_predictor', DurationPredictor(d_hid=512))
         self.add_module('prosodic_predictor', ProsodyPredictor(d_hid=512))
         self.add_module('decoder', Decoder())
@@ -207,11 +207,11 @@ class HolosTTS(nn.Module):
         d_en = t_en.transpose(1, 2)
         
         d = self.duration_predictor(d_en, voice_prosodic, input_lengths)
-        
+
         duration = torch.sigmoid(d).sum(axis=-1) / 1.0
-        pred_dur = torch.round(duration).clamp(min=1).long()[0]
-        #print(pred_dur)
-        #pred_dur[0] = 8
+        pred_dur = torch.round(duration).long()[0]
+        print(pred_dur)
+        #pred_dur[1] = 10
 
         pred_aln_trg = self.onnx_alignment(pred_dur, d_en.size(1))
         #print(pred_dur, duration)

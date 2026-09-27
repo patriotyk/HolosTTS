@@ -12,6 +12,46 @@ from holos.modules import AdainResBlk1d, AdaIN1d, AdaINResBlock1, get_padding
 from torch.nn import Conv1d, ConvTranspose1d
 
 
+def atan2_approx(imag, real):
+    """Quadrant-correct polynomial atan2 without the ONNX Atan operator.
+
+    The polynomial approximates atan(z) for z in [0, 1], after which the
+    original quadrant is reconstructed. Keeping the ratio bounded avoids the
+    instability of atan(imag / real) around a zero real component. The maximum
+    FP32 angular error is approximately 1.2e-5 radians.
+    """
+    abs_real = real.abs()
+    abs_imag = imag.abs()
+    high = torch.maximum(abs_real, abs_imag)
+    low = torch.minimum(abs_real, abs_imag)
+
+    # Avoid division by zero without perturbing non-zero complex values. A
+    # final mask gives atan2(0, 0) the same canonical value as PyTorch: zero.
+    safe_high = torch.where(high > 0, high, torch.ones_like(high))
+    ratio = low / safe_high
+    ratio_squared = ratio * ratio
+    atan_ratio = ratio * (
+        0.9998660
+        + ratio_squared * (
+            -0.3302995
+            + ratio_squared * (
+                0.1801410
+                + ratio_squared * (
+                    -0.0851330
+                    + ratio_squared * 0.0208351
+                )
+            )
+        )
+    )
+
+    half_pi = real.new_tensor(np.pi / 2)
+    pi = real.new_tensor(np.pi)
+    angle = torch.where(abs_imag > abs_real, half_pi - atan_ratio, atan_ratio)
+    angle = torch.where(real < 0, pi - angle, angle)
+    angle = torch.where(imag < 0, -angle, angle)
+    return torch.where(high == 0, torch.zeros_like(angle), angle)
+
+
 def init_weights(m, mean=0.0, std=0.01):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
@@ -88,7 +128,7 @@ class CustomSTFT(torch.nn.Module):
         real, imag = self.transform_components(input_data)
 
         magnitude = torch.sqrt(real**2 + imag**2 + 1e-8)
-        phase = torch.atan2(imag, real)
+        phase = atan2_approx(imag, real)
 
         # The ONNX Atan2 decomposition evaluates 0 / 0 as NaN, whereas
         # torch.atan2(0, 0) returns 0. Masked harmonic-source tails contain
@@ -278,15 +318,8 @@ class SourceModuleHnNSF(torch.nn.Module):
 
 
 class Generator(torch.nn.Module):
-    def __init__(self, style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, harmonic_representation="polar"):
+    def __init__(self, style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size):
         super(Generator, self).__init__()
-
-        if harmonic_representation not in {"polar", "cartesian"}:
-            raise ValueError(
-                "harmonic_representation must be 'polar'"
-                "or 'cartesian'"
-            )
-        self.harmonic_representation = harmonic_representation
 
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
@@ -340,10 +373,6 @@ class Generator(torch.nn.Module):
         )
 
     def harmonic_features(self, source):
-        if self.harmonic_representation == "cartesian":
-            real, imag = self.stft.transform_components(source)
-            return torch.cat([real, imag], dim=1)
-
         magnitude, phase = self.stft.transform(source)
         return torch.cat([magnitude, phase], dim=1)
         
@@ -430,16 +459,6 @@ class Generator(torch.nn.Module):
 
 
 
-    def remove_weight_norm(self):
-        print('Removing weight norm...')
-        for l in self.ups:
-            remove_weight_norm(l)
-        for l in self.resblocks:
-            l.remove_weight_norm()
-        remove_weight_norm(self.conv_post)
-
-
-
 class Decoder(nn.Module):
     def __init__(self, dim_in=512, style_dim=128,
                 resblock_kernel_sizes = [3,7,11],
@@ -447,8 +466,7 @@ class Decoder(nn.Module):
                 upsample_initial_channel=512,
                 resblock_dilation_sizes=[[1,3,5], [1,3,5], [1,3,5]],
                 upsample_kernel_sizes=[12, 10], 
-                gen_istft_n_fft=40, gen_istft_hop_size=10,
-                harmonic_representation="polar"):
+                gen_istft_n_fft=40, gen_istft_hop_size=10):
         super().__init__()
         
         self.decode = nn.ModuleList()
@@ -471,8 +489,7 @@ class Decoder(nn.Module):
         
         self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, 
                                    upsample_initial_channel, resblock_dilation_sizes, 
-                                   upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size,
-                                   harmonic_representation=harmonic_representation)
+                                   upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size)
         
     def forward(self, asr, F0_curve, N, s, lengths=None):
         
@@ -510,92 +527,6 @@ class Decoder(nn.Module):
         for block in self.decode:
             if res:
                 x = torch.cat([x, asr_res, F0, N], axis=1)
-            
-            if block.upsample_type == "none":
-                x = block(x, s, mask_in=asr_mask, mask_out=asr_mask)
-                x = x * asr_mask
-            else:
-                x = block(x, s, mask_in=asr_mask, mask_out=full_mask)
-                x = x * full_mask
-                res = False
-        if lengths is not None:
-            x = self.generator(x, s, F0_curve, full_mask, lengths)
-        else:
-            x = self.generator.inference(x, s, F0_curve)
-        return x
-    
-
-
-class DecoderNoN(nn.Module):
-    def __init__(self, dim_in=512, style_dim=128,
-                resblock_kernel_sizes = [3,7,11],
-                upsample_rates = [6, 5],
-                upsample_initial_channel=512,
-                resblock_dilation_sizes=[[1,3,5], [1,3,5], [1,3,5]],
-                upsample_kernel_sizes=[12, 10], 
-                gen_istft_n_fft=40, gen_istft_hop_size=10,
-                harmonic_representation="polar"):
-        super().__init__()
-        
-        self.decode = nn.ModuleList()
-        
-        self.encode = AdainResBlk1d(dim_in + 1, 1024, style_dim)
-        
-        self.decode.append(AdainResBlk1d(1024 + 1 + 64, 1024, style_dim))
-        self.decode.append(AdainResBlk1d(1024 + 1 + 64, 1024, style_dim))
-        self.decode.append(AdainResBlk1d(1024 + 1 + 64, 1024, style_dim))
-        self.decode.append(AdainResBlk1d(1024 + 1 + 64, 512, style_dim, upsample=True))
-
-        self.F0_conv = weight_norm(nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1))
-        
-        #elf.N_conv = weight_norm(nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1))
-        
-        self.asr_res = nn.Sequential(
-            weight_norm(nn.Conv1d(512, 64, kernel_size=1)),
-        )
-        
-        
-        self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, 
-                                   upsample_initial_channel, resblock_dilation_sizes, 
-                                   upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size,
-                                   harmonic_representation=harmonic_representation)
-        
-    def forward(self, asr, F0_curve, s, lengths=None):
-        
-        if self.training:
-            downlist = [0, 3, 7]
-            F0_down = downlist[random.randint(0, 2)]
-            # downlist = [0, 3, 7, 15]
-            # N_down = downlist[random.randint(0, 3)]
-            if F0_down:
-                F0_curve = F.avg_pool1d(F0_curve.unsqueeze(1), kernel_size=F0_down, stride=1, padding=F0_down//2)[:, 0, :]
-            # if N_down:
-            #     N = F.avg_pool1d(N.unsqueeze(1), kernel_size=N_down, stride=1, padding=N_down//2)[:, 0, :]
-
-        if lengths is not None:
-            full_mask = torch.arange(F0_curve.size(-1), device=F0_curve.device)[None, None, :] < lengths[:, None, None]
-            full_mask = full_mask.float()
-
-            asr_lengths = lengths // 2
-            asr_mask = torch.arange(asr.size(-1), device=asr.device)[None, None, :] < asr_lengths[:, None, None]
-            asr_mask = asr_mask.float()
-        else:
-            full_mask = torch.ones_like(F0_curve[:, None, :])
-            asr_mask = torch.ones_like(asr[:, :1, :])
-        
-        
-        F0 = self.F0_conv(F0_curve.unsqueeze(1)) * asr_mask
-        #N = self.N_conv(N.unsqueeze(1)) * asr_mask
-        
-        x = torch.cat([asr, F0], axis=1)
-        x = self.encode(x, s, mask_in=asr_mask, mask_out=asr_mask) * asr_mask
-        
-        asr_res = self.asr_res(asr) * asr_mask
-        
-        res = True
-        for block in self.decode:
-            if res:
-                x = torch.cat([x, asr_res, F0], axis=1)
             
             if block.upsample_type == "none":
                 x = block(x, s, mask_in=asr_mask, mask_out=asr_mask)

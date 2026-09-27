@@ -105,6 +105,23 @@ class AdaIN1d(nn.Module):
         return (1 + gamma) * self.norm(x, mask) + beta
 
 
+class AdaLN1d(nn.Module):
+    """Style-conditioned channel normalization, independently at each frame."""
+
+    def __init__(self, style_dim, num_features):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_features, elementwise_affine=False)
+        self.fc = nn.Linear(style_dim, num_features * 2)
+
+    def forward(self, x, s, mask=None):
+        gamma, beta = self.fc(s).unsqueeze(-1).chunk(2, dim=1)
+        x = self.norm(x.transpose(1, 2)).transpose(1, 2)
+        x = (1 + gamma) * x + beta
+        if mask is not None:
+            x = x * mask
+        return x
+
+
 class UpSample1d(nn.Module):
     def __init__(self, layer_type):
         super().__init__()
@@ -115,15 +132,6 @@ class UpSample1d(nn.Module):
             return x
         else:
             return F.interpolate(x, scale_factor=2, mode='nearest')
-
-
-class Snake1d(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.alpha = nn.Parameter(torch.ones(1, channels, 1))
-
-    def forward(self, x, eps=1e-9):
-        return x + (1.0 / (self.alpha + eps)) * (torch.sin(self.alpha * x) ** 2)
 
 
 class PixelShuffle1D(nn.Module):
@@ -144,13 +152,13 @@ class PixelShuffle1D(nn.Module):
 
 class AdainResBlk1d(nn.Module):
     def __init__(self, dim_in, dim_out, style_dim=64, actv=nn.LeakyReLU(0.2),
-                 upsample='none', dropout_p=0.0):
+                 upsample='none', dropout_p=0.0, norm_layer=AdaIN1d):
         super().__init__()
         self.actv = actv
         self.upsample_type = upsample
         self.upsample = UpSample1d(upsample)
         self.learned_sc = dim_in != dim_out
-        self._build_weights(dim_in, dim_out, style_dim)
+        self._build_weights(dim_in, dim_out, style_dim, norm_layer)
         self.dropout = nn.Dropout(dropout_p)
         
         if upsample == 'none':
@@ -167,12 +175,12 @@ class AdainResBlk1d(nn.Module):
                 PixelShuffle1D(2)
             )
         
-    def _build_weights(self, dim_in, dim_out, style_dim):
+    def _build_weights(self, dim_in, dim_out, style_dim, norm_layer):
         self.conv1 = weight_norm(nn.Conv1d(dim_in, dim_out, 3, 1, 1))
         self.conv2 = weight_norm(nn.Conv1d(dim_out, dim_out, 3, 1, 1))
         if style_dim is not None:
-            self.norm1 = AdaIN1d(style_dim, dim_in)
-            self.norm2 = AdaIN1d(style_dim, dim_out)
+            self.norm1 = norm_layer(style_dim, dim_in)
+            self.norm2 = norm_layer(style_dim, dim_out)
         else:
             self.norm1 = MaskedInstanceNorm1d(dim_in)
             self.norm2 = MaskedInstanceNorm1d(dim_out)
@@ -432,10 +440,9 @@ class EncoderLayerONNX(nn.Module):
 
 
 class TextEncoder(nn.Module):
-    def __init__(self, channels=512, kernel_size=5, depth=3, n_symbols=181, n_heads=4, n_layers=4, actv=nn.LeakyReLU(0.2), use_pe=False, scale_embedding=False, partial_rope=False, use_conv_pe=False):
+    def __init__(self, channels=512, kernel_size=5, depth=3, n_symbols=181, n_heads=4, n_layers=4, actv=nn.LeakyReLU(0.2), use_pe=False, partial_rope=False, use_conv_pe=False):
         super().__init__()
         self.channels = channels
-        self.scale_embedding = scale_embedding
         self.embedding = nn.Embedding(n_symbols, channels)
 
         padding = (kernel_size - 1) // 2
@@ -467,8 +474,6 @@ class TextEncoder(nn.Module):
 
     def forward(self, x, input_lengths):
         x = self.embedding(x)
-        if self.scale_embedding:
-            x = x * math.sqrt(self.channels)
         m = length_to_mask(input_lengths, max_len=x.size(1))
         mask_for_cnn = m.unsqueeze(1).to(x.dtype)
         src_key_padding_mask = m.bool()
@@ -651,9 +656,14 @@ class MultiScaleConvPE(nn.Module):
 
 class DurationPredictor(nn.Module):
 
-    def __init__(self, d_hid=640, style_dim=128, nlayers=6, max_dur=20, dropout=0.1, n_heads=8, mask_prob=0.1, use_rope=False):
+    def __init__(self, d_hid=640, style_dim=128, nlayers=6, max_dur=20, dropout=0.1, n_heads=8, mask_prob=0.1, use_rope=False, boundary_duration=2, start_boundary_duration=4, end_boundary_duration=2, style_dropout=0.1):
         super().__init__() 
         self.mask_prob = mask_prob
+        self.max_dur = int(max_dur)
+        self.boundary_duration = int(boundary_duration)
+        self.start_boundary_duration = int(start_boundary_duration)
+        self.end_boundary_duration = int(end_boundary_duration)
+        self.style_dropout = float(style_dropout)
         if mask_prob > 0:
             self.mask_token = nn.Parameter(torch.zeros(1, 1, d_hid)) 
         self.dropout_dur = dropout
@@ -683,35 +693,80 @@ class DurationPredictor(nn.Module):
             for _ in range(nlayers)
         ])
         
-        self.proj = nn.Linear(d_hid, max_dur)
-        nn.init.trunc_normal_(self.proj.weight, std=0.02)
-        nn.init.constant_(self.proj.bias, -2.0)
+        # Cumulative-link ordinal head:
+        #   P(duration > k | x) = sigmoid(score(x) - threshold[k])
+        # Positive threshold gaps guarantee a non-increasing probability
+        # sequence for every token. A single token score also prevents the
+        # head from learning unrelated decisions for neighbouring bins.
+        self.ordinal_score = nn.Linear(d_hid, 1)
+        nn.init.trunc_normal_(self.ordinal_score.weight, std=0.02)
+        nn.init.constant_(self.ordinal_score.bias, 2.0)
+
+        # Fix the first threshold at zero to remove the score/threshold
+        # translation ambiguity. Initial unit gaps and score bias 2.0 give
+        # an expected duration close to the old head's initialization.
+        initial_raw_gap = math.log(math.expm1(1.0))
+        self.ordinal_threshold_gaps = nn.Parameter(torch.full(
+            (max(self.max_dur - 1, 0),),
+            initial_raw_gap,
+        ))
+
+
+    def _duration_logits(self, x):
+        score = self.ordinal_score(x)
+        if self.max_dur == 1:
+            return score
+
+        positive_gaps = F.softplus(self.ordinal_threshold_gaps) + 1e-4
+        thresholds = torch.cat([
+            positive_gaps.new_zeros(1),
+            positive_gaps.cumsum(dim=0),
+        ])
+        return score - thresholds.view(1, 1, self.max_dur)
     
     def forward(self, x, style, text_lengths):
+        positions = torch.arange(x.size(1), device=x.device)[None, :]
+        text_mask = positions < text_lengths[:, None]
+
+        if self.training and self.style_dropout > 0:
+            # Some speaker/style embeddings can globally shift every duration.
+            # A text-only path keeps the predictor usable when a style embedding
+            # is outside the distribution seen by the duration head.
+            drop_style = torch.rand(style.size(0), 1, device=style.device) < self.style_dropout
+            style = torch.where(drop_style, torch.zeros_like(style), style)
+
         x = self.film(x, style)
+        # FiLM has a learned beta, so a zero-padded encoder state becomes non-zero.
+        # Keeping it would let ConvPE leak batch padding into valid tokens. In
+        # particular, short texts would see a different context during padded
+        # training batches and unpadded single-item inference.
+        x = x.masked_fill(~text_mask.unsqueeze(-1), 0.0)
         
         if self.training and getattr(self, "mask_prob", 0) > 0:
             mask = torch.rand(x.size(0), x.size(1), device=x.device) < self.mask_prob
-            padding_mask = torch.arange(x.size(1), device=x.device)[None, :] >= text_lengths[:, None]
-            mask = mask & (~padding_mask)
+            # Do not mask BOS/EOS, and disable token masking for one- and
+            # two-symbol utterances. Removing their only lexical evidence is a
+            # particularly severe train/inference mismatch for short text.
+            content_mask = text_mask & (positions > 0) & (positions < (text_lengths[:, None] - 1))
+            can_mask = (text_lengths > 4)[:, None]
+            mask = mask & content_mask & can_mask
             x = torch.where(mask.unsqueeze(-1), self.mask_token, x)
             
         x = x + self.conv_pe(x)
+        x = x.masked_fill(~text_mask.unsqueeze(-1), 0.0)
         
-        T = x.size(1)
-        padding_mask = torch.arange(T, device=x.device)[None, :] >= text_lengths[:, None]  # [B, T]
+        padding_mask = ~text_mask
         
         for layer, film_layer in zip(self.layers, self.films):
             x = film_layer(x, style)
+            x = x.masked_fill(~text_mask.unsqueeze(-1), 0.0)
             x = layer(x, src_key_padding_mask=padding_mask, rope=getattr(self, "rope", None))
 
-        text_mask = torch.arange(x.size(1), device=x.device)[None, :] < text_lengths[:, None]
         x = x.masked_fill(~text_mask.unsqueeze(-1), 0.0)
         
         x = F.dropout(x, p=self.dropout_dur, training=self.training)
-        dur = self.proj(x)                # [B, T, max_dur]
+        dur = self._duration_logits(x)    # [B, T, max_dur]
         return dur
-
 
 class ProsodyPredictor(nn.Module):
 
@@ -743,14 +798,14 @@ class ProsodyPredictor(nn.Module):
         ])
         
         self.F0 = nn.ModuleList()
-        self.F0.append(AdainResBlk1d(d_hid, d_hid, style_dim=style_dim, dropout_p=dropout))
-        self.F0.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim=style_dim, upsample=True, dropout_p=dropout))
-        self.F0.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim=style_dim, dropout_p=dropout))
+        self.F0.append(AdainResBlk1d(d_hid, d_hid, style_dim=style_dim, dropout_p=dropout, norm_layer=AdaLN1d))
+        self.F0.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim=style_dim, upsample=True, dropout_p=dropout, norm_layer=AdaLN1d))
+        self.F0.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim=style_dim, dropout_p=dropout, norm_layer=AdaLN1d))
 
         self.N = nn.ModuleList()
-        self.N.append(AdainResBlk1d(d_hid, d_hid, style_dim=style_dim, dropout_p=dropout))
-        self.N.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim=style_dim, upsample=True, dropout_p=dropout))
-        self.N.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim=style_dim, dropout_p=dropout))
+        self.N.append(AdainResBlk1d(d_hid, d_hid, style_dim=style_dim, dropout_p=dropout, norm_layer=AdaLN1d))
+        self.N.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim=style_dim, upsample=True, dropout_p=dropout, norm_layer=AdaLN1d))
+        self.N.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim=style_dim, dropout_p=dropout, norm_layer=AdaLN1d))
         
         self.F0_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
         self.N_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
