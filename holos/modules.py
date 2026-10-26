@@ -71,40 +71,6 @@ class Tokenizer:
         return ''.join(decoded)
 
 
-class MaskedInstanceNorm1d(nn.Module):
-    def __init__(self, num_features, eps=1e-5):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, x, mask=None):
-        if mask is None:
-            if not torch.onnx.is_in_onnx_export():
-                return F.instance_norm(x, eps=self.eps)
-            mask = torch.ones(x.shape[0], 1, x.shape[2], device=x.device, dtype=x.dtype)
-    
-        if not torch.onnx.is_in_onnx_export() and mask.min() == 1.0:
-            return F.instance_norm(x, eps=self.eps)
-
-        valid_lengths = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
-        mean = (x * mask).sum(dim=-1, keepdim=True) / valid_lengths
-        var = (((x - mean) * mask) ** 2).sum(dim=-1, keepdim=True) / valid_lengths
-        x_norm = (x - mean) / torch.sqrt(var + self.eps)
-        return x_norm * mask
-
-
-class AdaIN1d(nn.Module):
-    def __init__(self, style_dim, num_features):
-        super().__init__()
-        self.norm = MaskedInstanceNorm1d(num_features)
-        self.fc = nn.Linear(style_dim, num_features*2)
-
-    def forward(self, x, s, mask=None):
-        h = self.fc(s)
-        h = h.view(h.size(0), h.size(1), 1)
-        gamma, beta = torch.chunk(h, chunks=2, dim=1)
-        return (1 + gamma) * self.norm(x, mask) + beta
-
-
 class AdaLN1d(nn.Module):
     """Style-conditioned channel normalization, independently at each frame."""
 
@@ -116,6 +82,25 @@ class AdaLN1d(nn.Module):
     def forward(self, x, s, mask=None):
         gamma, beta = self.fc(s).unsqueeze(-1).chunk(2, dim=1)
         x = self.norm(x.transpose(1, 2)).transpose(1, 2)
+        x = (1 + gamma) * x + beta
+        if mask is not None:
+            x = x * mask
+        return x
+
+
+class FiLM1d(nn.Module):
+    """Style-conditioned affine modulation without normalization.
+
+    Unlike AdaLN1d it keeps each frame's magnitude, so residual branches still
+    see the amplitude envelope (as InstanceNorm did), while staying frame-local.
+    """
+
+    def __init__(self, style_dim, num_features):
+        super().__init__()
+        self.fc = nn.Linear(style_dim, num_features * 2)
+
+    def forward(self, x, s, mask=None):
+        gamma, beta = self.fc(s).unsqueeze(-1).chunk(2, dim=1)
         x = (1 + gamma) * x + beta
         if mask is not None:
             x = x * mask
@@ -150,15 +135,27 @@ class PixelShuffle1D(nn.Module):
         return x
 
 
+class LayerNorm1d(nn.Module):
+    def __init__(self, num_features, eps=1e-5):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_features, eps=eps)
+
+    def forward(self, x, mask=None):
+        out = self.norm(x.transpose(1, 2)).transpose(1, 2)
+        if mask is not None:
+            out = out * mask
+        return out
+
+
 class AdainResBlk1d(nn.Module):
     def __init__(self, dim_in, dim_out, style_dim=64, actv=nn.LeakyReLU(0.2),
-                 upsample='none', dropout_p=0.0, norm_layer=AdaIN1d):
+                 upsample='none', dropout_p=0.0):
         super().__init__()
         self.actv = actv
         self.upsample_type = upsample
         self.upsample = UpSample1d(upsample)
         self.learned_sc = dim_in != dim_out
-        self._build_weights(dim_in, dim_out, style_dim, norm_layer)
+        self._build_weights(dim_in, dim_out, style_dim)
         self.dropout = nn.Dropout(dropout_p)
         
         if upsample == 'none':
@@ -175,15 +172,15 @@ class AdainResBlk1d(nn.Module):
                 PixelShuffle1D(2)
             )
         
-    def _build_weights(self, dim_in, dim_out, style_dim, norm_layer):
+    def _build_weights(self, dim_in, dim_out, style_dim):
         self.conv1 = weight_norm(nn.Conv1d(dim_in, dim_out, 3, 1, 1))
         self.conv2 = weight_norm(nn.Conv1d(dim_out, dim_out, 3, 1, 1))
         if style_dim is not None:
-            self.norm1 = norm_layer(style_dim, dim_in)
-            self.norm2 = norm_layer(style_dim, dim_out)
+            self.norm1 = AdaLN1d(style_dim, dim_in)
+            self.norm2 = AdaLN1d(style_dim, dim_out)
         else:
-            self.norm1 = MaskedInstanceNorm1d(dim_in)
-            self.norm2 = MaskedInstanceNorm1d(dim_out)
+            self.norm1 = LayerNorm1d(dim_in)
+            self.norm2 = LayerNorm1d(dim_out)
         self.style_dim = style_dim
         if self.learned_sc:
             self.conv1x1 = weight_norm(nn.Conv1d(dim_in, dim_out, 1, 1, 0, bias=False))
@@ -202,6 +199,9 @@ class AdainResBlk1d(nn.Module):
         if mask_in is not None: x = x * mask_in
         x = self.actv(x)
         x = self.pool(x)
+        # The upsampling conv has a bias, so padded frames would be non-zero
+        # and conv1 would see them instead of its zero padding.
+        if mask_out is not None: x = x * mask_out
         x = self.conv1(self.dropout(x))
         if self.style_dim is not None:
             x = self.norm2(x, s, mask_out)
@@ -223,9 +223,9 @@ class AdainResBlk1d(nn.Module):
 
 
 
-class AdaINResBlock1(torch.nn.Module):
+class FiLMResBlock1(torch.nn.Module):
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5), style_dim=64):
-        super(AdaINResBlock1, self).__init__()
+        super(FiLMResBlock1, self).__init__()
         self.convs1 = nn.ModuleList([
             weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=dilation[0],
                                padding=get_padding(kernel_size, dilation[0]))),
@@ -246,24 +246,14 @@ class AdaINResBlock1(torch.nn.Module):
         ])
         self.convs2.apply(init_weights)
         
-        self.adain1 = nn.ModuleList([
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
-        ])
-        
-        self.adain2 = nn.ModuleList([
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
-        ])
-        
+        self.film1 = nn.ModuleList([FiLM1d(style_dim, channels) for _ in range(3)])
+        self.film2 = nn.ModuleList([FiLM1d(style_dim, channels) for _ in range(3)])
+
         self.alpha1 = nn.ParameterList([nn.Parameter(torch.ones(1, channels, 1)) for i in range(len(self.convs1))])
         self.alpha2 = nn.ParameterList([nn.Parameter(torch.ones(1, channels, 1)) for i in range(len(self.convs2))])
 
-
     def forward(self, x, s, mask=None):
-        for c1, c2, n1, n2, a1, a2 in zip(self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2):
+        for c1, c2, n1, n2, a1, a2 in zip(self.convs1, self.convs2, self.film1, self.film2, self.alpha1, self.alpha2):
             xt = n1(x, s, mask)
             xt = xt + (1 / a1) * (torch.sin(a1 * xt) ** 2)  # Snake1D
             if mask is not None: xt = xt * mask
@@ -798,14 +788,14 @@ class ProsodyPredictor(nn.Module):
         ])
         
         self.F0 = nn.ModuleList()
-        self.F0.append(AdainResBlk1d(d_hid, d_hid, style_dim=style_dim, dropout_p=dropout, norm_layer=AdaLN1d))
-        self.F0.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim=style_dim, upsample=True, dropout_p=dropout, norm_layer=AdaLN1d))
-        self.F0.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim=style_dim, dropout_p=dropout, norm_layer=AdaLN1d))
+        self.F0.append(AdainResBlk1d(d_hid, d_hid, style_dim=style_dim, dropout_p=dropout))
+        self.F0.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim=style_dim, upsample=True, dropout_p=dropout))
+        self.F0.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim=style_dim, dropout_p=dropout))
 
         self.N = nn.ModuleList()
-        self.N.append(AdainResBlk1d(d_hid, d_hid, style_dim=style_dim, dropout_p=dropout, norm_layer=AdaLN1d))
-        self.N.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim=style_dim, upsample=True, dropout_p=dropout, norm_layer=AdaLN1d))
-        self.N.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim=style_dim, dropout_p=dropout, norm_layer=AdaLN1d))
+        self.N.append(AdainResBlk1d(d_hid, d_hid, style_dim=style_dim, dropout_p=dropout))
+        self.N.append(AdainResBlk1d(d_hid, d_hid // 2, style_dim=style_dim, upsample=True, dropout_p=dropout))
+        self.N.append(AdainResBlk1d(d_hid // 2, d_hid // 2, style_dim=style_dim, dropout_p=dropout))
         
         self.F0_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
         self.N_proj = nn.Conv1d(d_hid // 2, 1, 1, 1, 0)
@@ -822,19 +812,21 @@ class ProsodyPredictor(nn.Module):
         x = self.input_proj(en_t)
         
         x = self.film(x, style)
-        
-        if self.training and getattr(self, "mask_prob", 0) > 0:
-            mask = torch.rand(x.size(0), x.size(1), device=x.device) < self.mask_prob
-            padding_mask = torch.arange(x.size(1), device=x.device)[None, :] >= half_lengths[:, None]
-            mask = mask & (~padding_mask)
-            x = torch.where(mask.unsqueeze(-1), self.mask_token, x)
-            
-        x = x + self.conv_pe(x)
 
-        
         T = x.size(1)
         padding_mask = torch.arange(T, device=x.device)[None, :] >= half_lengths[:, None]  # [B, T]
-        
+
+        if self.training and getattr(self, "mask_prob", 0) > 0:
+            mask = torch.rand(x.size(0), x.size(1), device=x.device) < self.mask_prob
+            mask = mask & (~padding_mask)
+            x = torch.where(mask.unsqueeze(-1), self.mask_token, x)
+
+        # input_proj and FiLM biases make padded frames non-zero. ConvPE would
+        # leak them into the last valid frames and attention then into all of
+        # them, so F0/energy would depend on batch padding or a static length.
+        x = x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+        x = x + self.conv_pe(x)
+
         for layer in self.layers:
             x = layer(x, src_key_padding_mask=padding_mask, rope=self.rope)
         

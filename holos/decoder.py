@@ -1,4 +1,6 @@
 import random
+import math
+from dataclasses import dataclass
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -6,9 +8,8 @@ import torch.nn.functional as F
 from torch import nn
 from typing import Optional
 from torch.nn.utils.parametrizations import weight_norm
-from torch.nn.utils import remove_weight_norm
 from scipy.signal import get_window
-from holos.modules import AdainResBlk1d, AdaIN1d, AdaINResBlock1, get_padding
+from holos.modules import AdainResBlk1d, FiLMResBlock1
 from torch.nn import Conv1d, ConvTranspose1d
 
 
@@ -58,23 +59,36 @@ def init_weights(m, mean=0.0, std=0.01):
         m.weight.data.normal_(mean, std)
 
 
+@dataclass
+class DecoderStreamState:
+    """State for one utterance; pass it back to Decoder.forward_chunk unchanged."""
+    asr: Optional[torch.Tensor] = None
+    f0: Optional[torch.Tensor] = None
+    energy: Optional[torch.Tensor] = None
+    source: Optional[torch.Tensor] = None
+    style: Optional[torch.Tensor] = None
+    phase: Optional[torch.Tensor] = None
+    start_frame: int = 0
+    total_frames: int = 0
+    emitted_samples: int = 0
+    finished: bool = False
+
+
 class CustomSTFT(torch.nn.Module):
     def __init__(self, n_fft=800, hop_length=200, win_length=800, window='hann'):
         super().__init__()
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
-        
+
         w = torch.from_numpy(get_window(window, win_length, fftbins=True).astype(np.float32))
         self.register_buffer("window", w, persistent=False)
-        
+
         t = torch.arange(n_fft).float()
         k = torch.arange(n_fft // 2 + 1).float()
         cos_basis = torch.cos(2 * np.pi * k[:, None] * t[None, :] / n_fft)
         sin_basis = torch.sin(2 * np.pi * k[:, None] * t[None, :] / n_fft)
-        
-        # Forward DFT weights (kept as non-persistent buffer, not used in transform but preserved for reference)
-        
+
         self.half_n_fft = n_fft // 2
 
         # Inverse DFT weights stored as non-persistent buffer (not saved in state_dict)
@@ -96,20 +110,12 @@ class CustomSTFT(torch.nn.Module):
             persistent=False,
         )
 
-        # Pre-compute frame offsets and DFT basis for fast, accurate GPU transform
-        self.register_buffer("frame_offsets", torch.arange(n_fft), persistent=False)
+        # Pre-compute DFT basis for fast, accurate GPU transform
         dft_mat = torch.cat([cos_basis, -sin_basis], dim=0) # [2F, n_fft]
         self.register_buffer("dft_mat", dft_mat, persistent=False)
 
-    
-    
-    def transform_components(self, input_data):
-        """Return continuous real/imaginary STFT components.
 
-        This representation contains the same information as magnitude/phase but
-        has no discontinuity at -pi/pi, so it is the preferred harmonic-source
-        representation for newly trained models.
-        """
+    def transform(self, input_data):
         x = input_data.unsqueeze(1)
         pad = self.n_fft // 2
         left = x[:, :, 1 : pad + 1].flip(dims=[-1])
@@ -121,20 +127,9 @@ class CustomSTFT(torch.nn.Module):
 
         real = out[:, :self.n_fft // 2 + 1, :]
         imag = out[:, self.n_fft // 2 + 1:, :]
-        return real, imag
-
-    def transform(self, input_data):
-        """Return magnitude/phase features compatible with existing checkpoints."""
-        real, imag = self.transform_components(input_data)
 
         magnitude = torch.sqrt(real**2 + imag**2 + 1e-8)
         phase = atan2_approx(imag, real)
-
-        # The ONNX Atan2 decomposition evaluates 0 / 0 as NaN, whereas
-        # torch.atan2(0, 0) returns 0. Masked harmonic-source tails contain
-        # exactly these zero complex bins, so canonicalize them explicitly.
-        zero_complex = (real == 0) & (imag == 0)
-        phase = torch.where(zero_complex, torch.zeros_like(phase), phase)
 
         # The imaginary part of the DC bin is mathematically zero. For a
         # negative real value, PyTorch returns +pi while ONNX Runtime's
@@ -154,12 +149,12 @@ class CustomSTFT(torch.nn.Module):
         re = magnitude * torch.cos(phase)
         im = magnitude * torch.sin(phase)
         x = torch.cat([re, im], dim=1) # [B, 2*F, T]
-        
+
         # 2. Frame Synthesis and Overlap-Add via ConvTranspose1d
         # x is [B, 2F, T]. idft_weight is [n_fft, 2F, 1]
         weight = self.idft_weight.squeeze(2).transpose(0, 1).unsqueeze(1) # [2F, 1, n_fft]
         output = F.conv_transpose1d(x, weight, stride=self.hop_length)
-        
+
         # Exact overlap-add normalization for the actual frame count. Computing
         # this with ConvTranspose1d keeps dynamic lengths ONNX-exportable.
         window_sum = F.conv_transpose1d(
@@ -172,12 +167,6 @@ class CustomSTFT(torch.nn.Module):
         # center=True removes n_fft // 2 samples from both ends.
         cutoff = self.half_n_fft
         return output[:, :, cutoff : -cutoff]
-
-    def forward(self, input_data):
-        self.magnitude, self.phase = self.transform(input_data)
-        reconstruction = self.inverse(self.magnitude, self.phase)
-        return reconstruction
-
 
 
 class SineGen(torch.nn.Module):
@@ -210,51 +199,35 @@ class SineGen(torch.nn.Module):
         uv = (f0 > self.voiced_threshold).type(torch.float32)
         return uv
 
-    def _f02sine(self, f0_values):
+    def _f02sine(self, f0_values, initial_phase=None):
         """ f0_values: (batchsize, length, dim)
             where dim indicates fundamental tone and overtones
+
+        Harmonics start phase-aligned with the fundamental (no random initial
+        phase). The source STFT (n_fft=40, 600 Hz bins) merges several
+        harmonics per bin, so random relative phases would make the
+        generator's excitation features differ between draws. The previous
+        downsampled-cumsum implementation also discarded its random offsets.
+        initial_phase continues a previous chunk.
         """
-        # convert to F0 in rad. The interger part n can be ignored
-        # because 2 * np.pi * n doesn't affect phase
         rad_values = (f0_values / self.sampling_rate) % 1
+        phase = torch.cumsum(rad_values, dim=1) * (2 * np.pi)
+        if initial_phase is not None:
+            phase = initial_phase + phase
 
-        # Initial phase offset for overtones only.
-        # Avoid in-place indexing here to prevent ScatterND in ONNX graph.
-        batch_size, seq_len, dim = rad_values.shape
-        rand_ini = torch.rand(batch_size, dim, device=f0_values.device)
-        harmonic_mask = (torch.arange(dim, device=f0_values.device) > 0).to(rand_ini.dtype)
-        rand_ini = rand_ini * harmonic_mask[None, :]
-        first_frame_mask = (torch.arange(seq_len, device=f0_values.device) == 0).to(rand_ini.dtype)
-        rad_values = rad_values + first_frame_mask[None, :, None] * rand_ini[:, None, :]
-
-        
-        # Downsample frequency to reduce the number of cumsum steps
-        # This prevents float32 precision loss (hoarseness) without needing float64
-        rad_values = torch.nn.functional.interpolate(rad_values.transpose(1, 2), 
-                                                        scale_factor=1/self.upsample_scale, 
-                                                        mode="linear").transpose(1, 2)
-
-        # Accumulate continuous phase on low-res frequency
-        phase = torch.cumsum(rad_values, dim=1) * 2 * np.pi
-        
-        # Upsample the continuous phase
-        phase = torch.nn.functional.interpolate(phase.transpose(1, 2) * self.upsample_scale, 
-                                                scale_factor=self.upsample_scale, mode="linear").transpose(1, 2)
-        
+        final_phase = torch.remainder(phase[:, -1:, :], 2 * np.pi)
         sines = torch.sin(phase)
-            
-        return sines
+        return sines, final_phase
 
-    def forward(self, f0):
-        """ sine_tensor, uv = forward(f0)
+    def forward(self, f0, initial_phase=None):
+        """ sine_tensor, uv, noise, final_phase = forward(f0, initial_phase)
         """
-        f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim,
-                             device=f0.device)
-        # fundamental component
-        fn = torch.multiply(f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device))
+        harmonics = torch.arange(1, self.harmonic_num + 2, device=f0.device, dtype=f0.dtype).view(1, 1, -1)
+        fn = f0 * harmonics
 
         # generate sine waveforms
-        sine_waves = self._f02sine(fn) * self.sine_amp
+        sine_waves, final_phase = self._f02sine(fn, initial_phase)
+        sine_waves = sine_waves * self.sine_amp
 
         # generate uv signal
         uv = self._f02uv(f0)
@@ -264,7 +237,7 @@ class SineGen(torch.nn.Module):
 
         # then: additive noise
         sine_waves = sine_waves * uv + noise
-        return sine_waves, uv, noise
+        return sine_waves, uv, noise, final_phase
 
 
 class SourceModuleHnNSF(torch.nn.Module):
@@ -300,21 +273,18 @@ class SourceModuleHnNSF(torch.nn.Module):
         self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
         self.l_tanh = torch.nn.Tanh()
 
-    def forward(self, x):
+    def forward(self, x, initial_phase=None, *, return_phase=False):
         """
-        Sine_source, noise_source = SourceModuleHnNSF(F0_sampled)
+        Sine_source = SourceModuleHnNSF(F0_sampled, initial_phase)
         F0_sampled (batchsize, length, 1)
-        Sine_source (batchsize, length, 1)
-        noise_source (batchsize, length 1)
         """
-        # source for harmonic branch
         with torch.no_grad():
-            sine_wavs, uv, _ = self.l_sin_gen(x)
+            sine_wavs, uv, _, final_phase = self.l_sin_gen(x, initial_phase)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
 
-        # source for noise branch, in the same shape as uv
-        #noise = torch.randn_like(uv) * self.sine_amp / 3
-        return sine_merge#, noise, uv
+        if return_phase or initial_phase is not None:
+            return sine_merge, final_phase
+        return sine_merge
 
 
 class Generator(torch.nn.Module):
@@ -323,7 +293,7 @@ class Generator(torch.nn.Module):
 
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
-        resblock = AdaINResBlock1
+        resblock = FiLMResBlock1
 
         self.m_source = SourceModuleHnNSF(
                     sampling_rate=24000,
@@ -334,7 +304,7 @@ class Generator(torch.nn.Module):
         self.f0_upsamp = torch.nn.Upsample(scale_factor=np.prod(upsample_rates) * gen_istft_hop_size)
         self.noise_convs = nn.ModuleList()
         self.noise_res = nn.ModuleList()
-        
+
         self.ups = nn.ModuleList()
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
             self.ups.append(weight_norm(
@@ -346,9 +316,9 @@ class Generator(torch.nn.Module):
             ch = upsample_initial_channel//(2**(i+1))
             for j, (k, d) in enumerate(zip(resblock_kernel_sizes,resblock_dilation_sizes)):
                 self.resblocks.append(resblock(ch, k, d, style_dim))
-                
+
             c_cur = upsample_initial_channel // (2 ** (i + 1))
-            
+
             if i + 1 < len(upsample_rates):  #
                 stride_f0 = np.prod(upsample_rates[i + 1:])
                 self.noise_convs.append(Conv1d(
@@ -357,8 +327,8 @@ class Generator(torch.nn.Module):
             else:
                 self.noise_convs.append(Conv1d(gen_istft_n_fft + 2, c_cur, kernel_size=1))
                 self.noise_res.append(resblock(c_cur, 11, [1,3,5], style_dim))
-                
-                
+
+
         self.post_n_fft = gen_istft_n_fft
         self.conv_post = weight_norm(Conv1d(ch, self.post_n_fft + 2, 7, 1, padding=3))
         self.ups.apply(init_weights)
@@ -375,8 +345,8 @@ class Generator(torch.nn.Module):
     def harmonic_features(self, source):
         magnitude, phase = self.stft.transform(source)
         return torch.cat([magnitude, phase], dim=1)
-        
-        
+
+
     def forward(self, x, s, f0, full_mask, lengths):
         with torch.no_grad():
             f0_upsampled = self.f0_upsamp(f0[:, None]* full_mask )
@@ -390,13 +360,13 @@ class Generator(torch.nn.Module):
             har_source = (har_source.transpose(1, 2) * audio_mask).squeeze(1)
 
             har = self.harmonic_features(har_source)
-        
+
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, 0.1)
             x = self.ups[i](x)
             if i == self.num_upsamples - 1:
                 x = self.reflection_pad(x)
-            
+
 
             x_source = self.noise_convs[i](har)
             min_len = min(x.size(-1), x_source.size(-1))
@@ -422,41 +392,33 @@ class Generator(torch.nn.Module):
         return self.stft.inverse(spec, phase)
 
 
-    def inference(self, x, s, f0):
+    def source(self, f0, initial_phase=None):
+        """Generate excitation once per new frame, including its continuation phase."""
         with torch.no_grad():
-            f0_upsampled = self.f0_upsamp(f0[:, None])
- 
-            f0_upsampled = f0_upsampled.transpose(1, 2)
-            har_source = self.m_source(f0_upsampled)
-            har_source = har_source.transpose(1, 2)[:, 0, :]
+            upsampled = self.f0_upsamp(f0[:, None]).transpose(1, 2)
+            source, phase = self.m_source(upsampled, initial_phase, return_phase=True)
+        return source.squeeze(-1), phase
 
-            har = self.harmonic_features(har_source)
-        
+    def spectrum(self, x, s, source):
+        """Shared exact-length path for offline and contextual streaming windows."""
+        har = self.harmonic_features(source)
         for i in range(self.num_upsamples):
-            x = F.leaky_relu(x, 0.1)
-            x = self.ups[i](x)
+            x = self.ups[i](F.leaky_relu(x, 0.1))
             if i == self.num_upsamples - 1:
                 x = self.reflection_pad(x)
-
             x_source = self.noise_convs[i](har)
-            x_source = self.noise_res[i](x_source, s)
+            min_len = min(x.size(-1), x_source.size(-1))
+            x = x[..., :min_len] + self.noise_res[i](x_source[..., :min_len], s)
+            x = sum(self.resblocks[i * self.num_kernels + j](x, s)
+                    for j in range(self.num_kernels)) / self.num_kernels
+        x = self.conv_post(F.leaky_relu(x))
+        return torch.exp(x[:, :self.post_n_fft // 2 + 1]), torch.sin(x[:, self.post_n_fft // 2 + 1:])
 
-            x = (x + x_source)
-            xs = None
-            for j in range(self.num_kernels):
-                if xs is None:
-                    xs = self.resblocks[i*self.num_kernels+j](x, s)
-                else:
-                    xs += self.resblocks[i*self.num_kernels+j](x, s)
-            x = (xs / self.num_kernels)
-        x = F.leaky_relu(x)
-        x = self.conv_post(x)
-        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
-        phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
-
+    def inference(self, x, s, f0, *, source=None):
+        if source is None:
+            source, _ = self.source(f0)
+        spec, phase = self.spectrum(x, s, source)
         return self.stft.inverse(spec, phase)
-
-
 
 
 class Decoder(nn.Module):
@@ -465,34 +427,32 @@ class Decoder(nn.Module):
                 upsample_rates = [6, 5],
                 upsample_initial_channel=512,
                 resblock_dilation_sizes=[[1,3,5], [1,3,5], [1,3,5]],
-                upsample_kernel_sizes=[12, 10], 
+                upsample_kernel_sizes=[12, 10],
                 gen_istft_n_fft=40, gen_istft_hop_size=10):
         super().__init__()
-        
+
         self.decode = nn.ModuleList()
-        
+
         self.encode = AdainResBlk1d(dim_in + 2, 1024, style_dim)
-        
+
         self.decode.append(AdainResBlk1d(1024 + 2 + 64, 1024, style_dim))
         self.decode.append(AdainResBlk1d(1024 + 2 + 64, 1024, style_dim))
         self.decode.append(AdainResBlk1d(1024 + 2 + 64, 1024, style_dim))
         self.decode.append(AdainResBlk1d(1024 + 2 + 64, 512, style_dim, upsample=True))
 
         self.F0_conv = weight_norm(nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1))
-        
+
         self.N_conv = weight_norm(nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1))
-        
+
         self.asr_res = nn.Sequential(
             weight_norm(nn.Conv1d(512, 64, kernel_size=1)),
         )
-        
-        
-        self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, 
-                                   upsample_initial_channel, resblock_dilation_sizes, 
+
+        self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates,
+                                   upsample_initial_channel, resblock_dilation_sizes,
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size)
-        
+
     def forward(self, asr, F0_curve, N, s, lengths=None):
-        
         if self.training:
             downlist = [0, 3, 7]
             F0_down = downlist[random.randint(0, 2)]
@@ -513,21 +473,20 @@ class Decoder(nn.Module):
         else:
             full_mask = torch.ones_like(F0_curve[:, None, :])
             asr_mask = torch.ones_like(asr[:, :1, :])
-        
-        
+
         F0 = self.F0_conv(F0_curve.unsqueeze(1)) * asr_mask
-        N = self.N_conv(N.unsqueeze(1)) * asr_mask
-        
-        x = torch.cat([asr, F0, N], axis=1)
+        N_feat = self.N_conv(N.unsqueeze(1)) * asr_mask
+
+        x = torch.cat([asr, F0, N_feat], axis=1)
         x = self.encode(x, s, mask_in=asr_mask, mask_out=asr_mask) * asr_mask
-        
+
         asr_res = self.asr_res(asr) * asr_mask
-        
+
         res = True
         for block in self.decode:
             if res:
-                x = torch.cat([x, asr_res, F0, N], axis=1)
-            
+                x = torch.cat([x, asr_res, F0, N_feat], axis=1)
+
             if block.upsample_type == "none":
                 x = block(x, s, mask_in=asr_mask, mask_out=asr_mask)
                 x = x * asr_mask
@@ -540,3 +499,193 @@ class Decoder(nn.Module):
         else:
             x = self.generator.inference(x, s, F0_curve)
         return x
+
+    def features(self, asr, F0_curve, N, s):
+        """Shared unpadded feature path for inference and streaming windows."""
+        F0 = self.F0_conv(F0_curve.unsqueeze(1))
+        N_feat = self.N_conv(N.unsqueeze(1))
+        x = self.encode(torch.cat([asr, F0, N_feat], dim=1), s)
+        asr_res = self.asr_res(asr)
+        res = True
+        for block in self.decode:
+            if res:
+                x = torch.cat([x, asr_res, F0, N_feat], dim=1)
+            x = block(x, s)
+            if block.upsample_type != "none":
+                res = False
+        return x
+
+    def inference(self, asr, F0_curve, N, s, *, source=None):
+        """Decode an exact-length window; source may supply cached excitation."""
+        x = self.features(asr, F0_curve, N, s)
+        return self.generator.inference(x, s, F0_curve, source=source)
+
+    def streaming_context_frames(self):
+        """Conservative left/right receptive-field bound in ASR frames.
+
+        AdaLN and FiLM act within each frame. Only convolutions, resampling and STFT
+        expand temporal support. Include rounding slack for the sample grids.
+        """
+        def radius(conv):
+            return (conv.kernel_size[0] - 1) * conv.dilation[0] / 2
+
+        def res_radius(block):
+            return sum(radius(c) for c in list(block.convs1) + list(block.convs2))
+
+        jump = 1.0
+        reach = max(radius(self.F0_conv), radius(self.N_conv)) / 2
+        for block in [self.encode, *self.decode]:
+            if block.upsample_type != "none":
+                reach += radius(block.pool[0]) * jump
+                jump /= 2
+                reach += jump  # PixelShuffle / nearest-neighbor grid offset.
+            reach += (radius(block.conv1) + radius(block.conv2)) * jump
+        gen = self.generator
+        samples_per_asr = 2 * int(gen.total_upsample)
+        spectral_jump = gen.stft.hop_length / samples_per_asr
+        for i, up in enumerate(gen.ups):
+            # Full transpose-kernel span also bounds its grid offset.
+            reach += 2 * radius(up) * jump / up.stride[0]
+            jump /= up.stride[0]
+            if i == gen.num_upsamples - 1:
+                reach += jump  # ReflectionPad1d((1, 0)).
+            source_reach = gen.stft.n_fft / samples_per_asr
+            source_reach += radius(gen.noise_convs[i]) * spectral_jump
+            source_reach += res_radius(gen.noise_res[i]) * jump
+            reach = max(reach, source_reach)
+            reach += max(res_radius(gen.resblocks[i * gen.num_kernels + j])
+                         for j in range(gen.num_kernels)) * jump
+        reach += radius(gen.conv_post) * jump + gen.stft.n_fft / samples_per_asr
+        return math.ceil(reach) + 1
+
+    @torch.inference_mode()
+    def forward_chunk(self, asr, F0_curve, N, s, state=None, *, final=False):
+        """Return (stable_audio, state), with audio shaped [batch, 1, samples].
+
+        Pass the returned state on every call. Symmetric convolutions require
+        lookahead, so early calls can return empty audio. Use final=True on the
+        last input, or finish through StreamingDecoder.flush(). Phase alone is
+        insufficient: state also retains bounded input and excitation context.
+        """
+        if self.training:
+            raise ValueError("Streaming requires decoder.eval()")
+        state = DecoderStreamState() if state is None else state
+        if state.finished:
+            raise ValueError("The decoder stream is finished; start a new state")
+        if (asr.ndim != 3 or F0_curve.ndim != 2 or N.ndim != 2 or s.ndim != 2
+                or F0_curve.shape != N.shape
+                or F0_curve.shape != (asr.shape[0], asr.shape[-1] * 2)
+                or s.shape[0] != asr.shape[0] or asr.shape[-1] == 0):
+            raise ValueError("Expected nonempty ASR [B,C,T], F0/energy [B,2*T], style [B,S]")
+        if any(t.device != asr.device or t.dtype != asr.dtype for t in (F0_curve, N, s)):
+            raise ValueError("All streaming inputs must share device and dtype")
+        if state.asr is not None:
+            if (asr.shape[:2] != state.asr.shape[:2] or asr.device != state.asr.device
+                    or asr.dtype != state.asr.dtype or not torch.equal(s, state.style)):
+                raise ValueError("Batch, device, dtype and style must stay fixed; reset the stream")
+        source, state.phase = self.generator.source(F0_curve, state.phase)
+        for name, value in (("asr", asr), ("f0", F0_curve), ("energy", N), ("source", source)):
+            previous = getattr(state, name)
+            setattr(state, name, value.clone() if previous is None else torch.cat([previous, value], dim=-1))
+        if state.style is None:
+            state.style = s.clone()
+        state.total_frames += asr.shape[-1]
+        return self._drain_stream(state, final=final), state
+
+    def _drain_stream(self, state, *, final):
+        samples_per_asr = 2 * int(self.generator.total_upsample)
+        context = self.streaming_context_frames()
+        end_frame = state.total_frames if final else max(0, state.total_frames - context)
+        end_sample = end_frame * samples_per_asr
+        if end_sample > state.emitted_samples:
+            audio = self.inference(state.asr, state.f0, state.energy, state.style, source=state.source)
+            start = state.emitted_samples - state.start_frame * samples_per_asr
+            end = end_sample - state.start_frame * samples_per_asr
+            if end > audio.shape[-1]:
+                raise RuntimeError("Decoder output length does not match its upsample factor")
+            result = audio[..., start:end].clone()
+            state.emitted_samples = end_sample
+        else:
+            result = state.asr.new_empty(state.asr.shape[0], 1, 0)
+        if final:
+            state.finished = True
+            state.asr = state.f0 = state.energy = state.source = None
+        else:
+            # Clone slices so a small retained window cannot hold an entire
+            # utterance's backing storage alive.
+            drop = max(0, end_frame - context - state.start_frame)
+            if drop:
+                state.asr = state.asr[..., drop:].clone()
+                state.f0 = state.f0[..., 2 * drop:].clone()
+                state.energy = state.energy[..., 2 * drop:].clone()
+                state.source = state.source[..., drop * samples_per_asr:].clone()
+                state.start_frame += drop
+        return result
+
+
+class StreamingDecoder(nn.Module):
+    """Bounded-context streaming for an eval-mode Decoder.
+
+    step() accepts up to chunk_asr_frames ASR frames (including a short final
+    chunk) and may return empty audio during lookahead. Concatenate all step()
+    outputs and flush() exactly once to recover the complete aligned utterance.
+    Lookahead is exposed as lookahead_samples; reset() starts another utterance.
+
+    reset(skip_samples=...) drops leading output, typically the BOS silence:
+    pred_dur[0] * samples_per_asr_frame minus a short margin. Those frames are
+    still decoded as left context, so the speech onset is unchanged.
+    """
+    def __init__(self, decoder: Decoder, chunk_asr_frames: int = 40):
+        super().__init__()
+        if not isinstance(chunk_asr_frames, int) or chunk_asr_frames < 1:
+            raise ValueError("chunk_asr_frames must be a positive integer")
+        self.decoder = decoder
+        self.chunk_asr_frames = chunk_asr_frames
+        self.chunk_f0_frames = chunk_asr_frames * 2
+        self.samples_per_asr_frame = 2 * int(decoder.generator.total_upsample)
+        self.chunk_audio_samples = chunk_asr_frames * self.samples_per_asr_frame
+        self.lookahead_samples = decoder.streaming_context_frames() * self.samples_per_asr_frame
+        self.reset()
+
+    def reset(self, skip_samples: int = 0, fade_samples: int = 120):
+        """Start an utterance; skip_samples > 0 trims leading output and ramps in
+        the next fade_samples (120 = 5 ms at 24 kHz) to avoid a click."""
+        if skip_samples < 0 or fade_samples < 0:
+            raise ValueError("skip_samples and fade_samples must be nonnegative")
+        self.state = None
+        self.skip_left = int(skip_samples)
+        self.fade_samples = int(fade_samples) if skip_samples else 0
+        self.fade_done = 0
+
+    def _trim(self, audio):
+        if self.skip_left:
+            skip = min(self.skip_left, audio.shape[-1])
+            audio = audio[..., skip:]
+            self.skip_left -= skip
+        if self.fade_done < self.fade_samples and audio.shape[-1]:
+            count = min(self.fade_samples - self.fade_done, audio.shape[-1])
+            ramp = torch.arange(self.fade_done + 1, self.fade_done + count + 1,
+                                device=audio.device, dtype=audio.dtype) / self.fade_samples
+            audio = torch.cat([audio[..., :count] * ramp, audio[..., count:]], dim=-1)
+            self.fade_done += count
+        return audio
+
+    @torch.inference_mode()
+    def step(self, asr_chunk, f0_chunk, energy_chunk, s):
+        if asr_chunk.shape[-1] > self.chunk_asr_frames:
+            raise ValueError("Input exceeds chunk_asr_frames")
+        audio, self.state = self.decoder.forward_chunk(
+            asr_chunk, f0_chunk, energy_chunk, s, self.state,
+        )
+        return self._trim(audio.squeeze(1))
+
+    @torch.inference_mode()
+    def flush(self):
+        """Emit the remaining real samples, including the utterance's right edge."""
+        if self.state is None:
+            raise ValueError("Call step() before flush()")
+        if self.state.finished:
+            return self.state.style.new_empty(self.state.style.shape[0], 0)
+        if self.decoder.training:
+            raise ValueError("Streaming requires decoder.eval()")
+        return self._trim(self.decoder._drain_stream(self.state, final=True).squeeze(1))

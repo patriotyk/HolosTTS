@@ -121,9 +121,10 @@ class HolosTTS(nn.Module):
             params = torch.load(resolved_weights_path, map_location=device)
             if isinstance(params, dict) and 'vocab' in params:
                 self.tokenizer = Tokenizer(params['vocab'])
-                self.load_state_dict(params['state_dict'], strict=True)
+                state_dict = params['state_dict']
             else:
-                self.load_state_dict(params, strict=True)
+                state_dict = params
+            self.load_state_dict(state_dict, strict=True)
 
             resolved_voices_path = None
             if voices_path and os.path.isfile(voices_path):
@@ -138,9 +139,6 @@ class HolosTTS(nn.Module):
                 self.voices = torch.load(resolved_voices_path, map_location=device)
             else:
                 raise FileNotFoundError("Voices file not found")
-
-    def set_onnx_phase_scale(self, value: float):
-        self.decoder.generator.stft.set_onnx_phase_scale(value)
 
     def list_voices(self):
         return list(self.voices.keys())

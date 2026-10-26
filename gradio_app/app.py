@@ -89,8 +89,6 @@ def encode_audio_prompt(audio_path):
 
 @spaces.GPU
 def synthesize(text, voice_name, custom_voice=None, progress=gr.Progress()):
-    if len(text.strip()) < 10:
-        raise gr.Error("Текст закороткий")
     if len(text) > 50000:
         raise gr.Error("Текст мусить бути <50k символів")
     print("*** saying ***")
