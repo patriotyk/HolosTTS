@@ -5,6 +5,4 @@ scipy
 soundfile
 librosa
 transformers
-ukrainian-word-stress @ git+https://github.com/patriotyk/ukrainian-word-stress.git
-ipa-uk @ git+https://github.com/patriotyk/ipa-uk.git
 huggingface-hub
