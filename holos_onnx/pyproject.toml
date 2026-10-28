@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "holos-tts-onnx"
+version = "0.2.0"
+description = "PyTorch-free ONNX Runtime inference for HolosTTS"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "huggingface-hub>=0.23",
+    # No GPU build exists for macOS; elsewhere the extras install CUDA and cuDNN.
+    "onnxruntime>=1.28; sys_platform == 'darwin'",
+    "onnxruntime-gpu[cuda,cudnn]>=1.28; sys_platform != 'darwin'",
+]
+
+[project.optional-dependencies]
+tensorrt = ["tensorrt-cu13>=10.13,<11"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
