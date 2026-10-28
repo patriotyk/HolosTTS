@@ -3,22 +3,14 @@ requires = ["setuptools>=62.6.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "holos"
+name = "holos-tts"
 version = "0.1.0"
 description = "Holos TTS inference package"
 requires-python = ">=3.8"
 dynamic = ["dependencies"]
 
-[project.optional-dependencies]
-gradio = [
-    "gradio",
-]
-
-[project.scripts]
-holos-app = "gradio_app.app:main"
-
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements_inference.txt"]}
 
 [tool.setuptools.packages.find]
-include = ["holos*", "gradio_app*"]
+include = ["holos", "holos.*"]
