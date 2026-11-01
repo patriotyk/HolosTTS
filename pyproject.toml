@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "holos-tts"
-version = "0.3"
+version = "0.4"
 description = "HolosTTS text-to-speech on PyTorch"
 readme = "README.md"
 license = "MIT"
