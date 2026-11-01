@@ -163,3 +163,5 @@ Each ONNX folder holds `holos_onnx.json` (vocabulary and parameters), `voices.np
 ## License
 
 The code and models are released under the [MIT license](https://github.com/patriotyk/HolosTTS/blob/main/LICENSE).
+
+I took the preset voices without the consent of their owners. For commercial use, either agree on it with the voice owners, clone your own voices from audio prompts whose license allows commercial use, or mix several voices so that none of them is recognizable.

@@ -82,17 +82,19 @@ description = '''
 <a href="https://pypi.org/project/holos-tts/">PyPI</a>
 </p>
 
-HolosTTS — моя відкрита модель синтезу української мови з найкращим співвідношенням якості та швидкості:
+HolosTTS — відкрита модель синтезу української мови з найкращим співвідношенням якості та швидкості:
 на відеокарті RTX 3090 перший шматок аудіо готовий за 5 мс. Модель має набір готових голосів і може
 клонувати голос з короткого аудіозразка. Вона працює на PyTorch або на ONNX Runtime без PyTorch:
 на CPU, CUDA і TensorRT.
 
 - **Наголоси** розставляються автоматично, але деякі можуть бути неправильними. Тоді поставте `+` після
   наголошеного голосного, наприклад «Му+дрого».
-- **Цифри, дати і скорочення** модель читає погано. Кнопка «Вербалізувати» (бета) замінює їх словами.
+- **Цифри, дати і скорочення** модель не інтерпретує сама, тому кнопка «Вербалізувати» (бета) замінює їх
+  словами.
 - **Швидкість** більше одиниці робить мовлення швидшим, менше одиниці — повільнішим.
-- **Клонування голосу:** завантажте або запишіть кілька секунд чистого мовлення без музики і сторонніх
-  голосів (до 30 с). Отриманий голос можна завантажити як файл `.pt` і використовувати в своєму коді.
+- **Клонування голосу:** завантажте або запишіть чисте мовлення без музики і сторонніх голосів. Що довший
+  аудіопромт, то краще модель передає голос. Отриманий голос можна завантажити як файл `.pt` і використовувати
+  в своєму коді.
 '''
 
 examples = [
@@ -165,10 +167,6 @@ def synthesize(text, speed, voice_name, custom_voice=None, progress=gr.Progress(
     return 24000, data
 
 
-def select_example(df, evt: gr.SelectData):
-    return evt.row_value
-
-
 def create_demo():
     if gr is None:
         raise ImportError("Gradio is not installed: pip install -r gradio_app/requirements.txt")
@@ -203,9 +201,7 @@ def create_demo():
         synthesise_button.click(synthesize, inputs=[input_text, speed, speaker, style_state], outputs=[output_audio])
         audio_prompt.change(encode_audio_prompt, inputs=[audio_prompt], outputs=[style_state, style_download])
 
-        with gr.Row():
-            examples_table = gr.Dataframe(wrap=True, headers=["Текст", "Швидкість"], datatype=["str", "number"], value=examples, interactive=False, show_label=True, label="Приклади:")
-            examples_table.select(select_example, inputs=[examples_table], outputs=[input_text, speed])
+        gr.Examples(examples=examples, inputs=[input_text, speed], label="Приклади:", examples_per_page=10)
 
     return demo
 
