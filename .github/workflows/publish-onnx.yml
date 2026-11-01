@@ -28,10 +28,12 @@ jobs:
               raise SystemExit(f"Tag onnx-v{tag} does not match holos_onnx/pyproject.toml version {version}")
           EOF
       - name: Test
-        # The CPU onnxruntime is enough: the tests use fake sessions.
+        # The CPU onnxruntime is enough: the tests use fake sessions. The
+        # parity test compares the streaming helpers with holos/streaming.py.
         run: |
           python -m pip install numpy huggingface-hub onnxruntime
           python tests/test_inference.py
+          python tests/test_streaming_parity.py
       - name: Build
         run: |
           python -m pip install build

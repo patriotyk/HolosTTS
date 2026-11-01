@@ -5,11 +5,12 @@ import torch.nn as nn
 import soundfile as sf
 import librosa
 import torchaudio
-from typing import Union
+from typing import Iterator, Union
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from holos.modules import StyleEncoder, TextEncoder, ProsodyPredictor, DurationPredictor, Tokenizer
 from holos.decoder import Decoder
+from holos.streaming import leading_silence_samples, stream_windows, trim_leading
 
 
 class VoiceEncoder(nn.Module):
@@ -145,6 +146,48 @@ class HolosTTS(nn.Module):
     
     @torch.inference_mode()
     def generate(self, text: str, voice: Union[str, torch.Tensor]) -> torch.Tensor:
+        return self.forward(*self._prepare_inputs(text, voice))
+
+    @torch.inference_mode()
+    def stream(self, text: str, voice: Union[str, torch.Tensor], chunk_frames: int = 40,
+               trim_silence: bool = True) -> Iterator[torch.Tensor]:
+        """Yield audio [batch, samples] chunk by chunk; concatenated, the chunks
+        equal generate() (with trim_silence=False and the same source noise).
+
+        Text encoding and prosody run once for the whole text. Each chunk of
+        chunk_frames frames (40 = 1 s) is then decoded with the decoder's
+        receptive field as context on both sides, using the excitation of the
+        whole utterance.
+
+        trim_silence drops the boundary-token silence at the start (about 50 ms)
+        except a 10 ms margin and fades in over 5 ms.
+        """
+        aligned, f0, energy, voice_acoustic, _, pred_dur = self._encode(*self._prepare_inputs(text, voice))
+        chunks = self._decode_windows(aligned, f0, energy, voice_acoustic, chunk_frames)
+        if not trim_silence:
+            yield from chunks
+            return
+        generator = self.decoder.generator
+        samples_per_frame = 2 * int(generator.total_upsample)
+        skip = leading_silence_samples(int(pred_dur[0]), samples_per_frame, generator.m_source.l_sin_gen.sampling_rate)
+        yield from trim_leading(chunks, skip)
+
+    def _decode_windows(self, aligned, f0, energy, voice_acoustic, chunk_frames):
+        step = 2 * int(self.decoder.generator.total_upsample)
+        source, _ = self.decoder.generator.source(f0)
+        context = self.decoder.streaming_context_frames()
+        for start, end, window_start, window_end in stream_windows(aligned.shape[-1], chunk_frames, context):
+            audio = self.decoder.inference(
+                aligned[..., window_start:window_end],
+                f0[:, 2 * window_start:2 * window_end],
+                energy[:, 2 * window_start:2 * window_end],
+                voice_acoustic,
+                source=source[..., step * window_start:step * window_end],
+            )
+            offset = start - window_start
+            yield audio.reshape(audio.shape[0], -1)[:, step * offset:step * (offset + end - start)]
+
+    def _prepare_inputs(self, text: str, voice: Union[str, torch.Tensor]):
         if isinstance(voice, torch.Tensor):
             voice_tensor = voice
             if voice_tensor.dim() == 1:
@@ -159,8 +202,7 @@ class HolosTTS(nn.Module):
         
         tokens = torch.tensor(tokens).unsqueeze(0).to(self.device)
         input_lengths = torch.tensor([tokens.size(1)], dtype=torch.long, device=self.device)
-        
-        return self.forward(tokens, voice_tensor, input_lengths)
+        return tokens, voice_tensor, input_lengths
 
     
         
@@ -198,6 +240,10 @@ class HolosTTS(nn.Module):
     @torch.no_grad()
     def encode(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor):
         """Encoder part: text → aligned features, f0, energy. No decoder."""
+        return self._encode(tokens, voice, input_lengths)[:5]
+
+    def _encode(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor):
+        """encode() plus the predicted per-token durations in frames."""
         voice_acoustic = voice[:, :128]
         voice_prosodic = voice[:, 128:]
         
@@ -208,51 +254,16 @@ class HolosTTS(nn.Module):
 
         duration = torch.sigmoid(d).sum(axis=-1) / 1.0
         pred_dur = torch.round(duration).long()[0]
-        print(pred_dur)
-        #pred_dur[1] = 10
 
         pred_aln_trg = self.onnx_alignment(pred_dur, d_en.size(1))
-        #print(pred_dur, duration)
-        # indices = torch.repeat_interleave(torch.arange(tokens.shape[1], device=tokens.device), pred_dur)
-        # pred_aln_trg = torch.zeros((tokens.shape[1], indices.shape[0]), device=tokens.device)
-        # pred_aln_trg[indices, torch.arange(indices.shape[0], device=tokens.device)] = 1
-        # pred_aln_trg = pred_aln_trg.unsqueeze(0)
-
-
-        # attn_list = []
-        # max_len = d_en.size(1)
-        # max_dur = 0
-        # pred_durs = []
-        # pred_lens = []
-        # for bib in range(len(d_en)):
-        #     l = int(input_lengths[bib])
-        #     duration = torch.sigmoid(d[bib]).sum(axis=-1)
-        #     pred_dur = torch.round(duration.squeeze(0)[:l]).clamp(min=1)
-        #     print(pred_dur)
-        #     #pred_dur[-1] =1
-        #     pred_durs.append(pred_dur)
-        #     max_dur = max(max_dur, int(pred_dur.sum().item()))
-        #     pred_lens.append(pred_dur.sum().item() * 2.0)
-
-        # for bib in range(len(d_en)):
-        #     l = int(input_lengths[bib])
-        #     pred_dur = pred_durs[bib]
-        #     pred_aln_trg = torch.zeros(max_len, max_dur)
-        #     c_frame = 0
-        #     for i in range(l):
-        #         dur_val = int(pred_dur[i].item())
-        #         pred_aln_trg[i, c_frame:c_frame + dur_val] = 1
-        #         c_frame += dur_val
-        #     attn_list.append(pred_aln_trg)
-        # pred_aln_trg = torch.stack(attn_list).to(tokens.device)
         
         en = d_en.transpose(-1, -2) @ pred_aln_trg
         wav_lengths = pred_dur.sum(dim=0, keepdim=True) * 2
         
-        f0, energy = self.prosodic_predictor(en, voice_prosodic, wav_lengths)
+        f0, energy = self.prosodic_predictor(en, voice_prosodic, wav_lengths)   
         t_en = self.text_encoder(tokens, input_lengths)
         aln = t_en @ pred_aln_trg
-        return aln, f0, energy, voice_acoustic, wav_lengths
+        return aln, f0, energy, voice_acoustic, wav_lengths, pred_dur
 
 
     @torch.no_grad()

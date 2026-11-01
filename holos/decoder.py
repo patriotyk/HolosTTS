@@ -1,12 +1,10 @@
 import random
 import math
-from dataclasses import dataclass
 import torch
 import numpy as np
 import torch.nn.functional as F
 
 from torch import nn
-from typing import Optional
 from torch.nn.utils.parametrizations import weight_norm
 from scipy.signal import get_window
 from holos.modules import AdainResBlk1d, FiLMResBlock1
@@ -57,21 +55,6 @@ def init_weights(m, mean=0.0, std=0.01):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
         m.weight.data.normal_(mean, std)
-
-
-@dataclass
-class DecoderStreamState:
-    """State for one utterance; pass it back to Decoder.forward_chunk unchanged."""
-    asr: Optional[torch.Tensor] = None
-    f0: Optional[torch.Tensor] = None
-    energy: Optional[torch.Tensor] = None
-    source: Optional[torch.Tensor] = None
-    style: Optional[torch.Tensor] = None
-    phase: Optional[torch.Tensor] = None
-    start_frame: int = 0
-    total_frames: int = 0
-    emitted_samples: int = 0
-    finished: bool = False
 
 
 class CustomSTFT(torch.nn.Module):
@@ -209,9 +192,16 @@ class SineGen(torch.nn.Module):
         generator's excitation features differ between draws. The previous
         downsampled-cumsum implementation also discarded its random offsets.
         initial_phase continues a previous chunk.
+
+        The phase is accumulated in float64: a float32 cumsum over a whole
+        utterance drifts with its length (~4e-3 cycles at the high harmonics
+        after 25 s), which the generator amplifies into audible differences.
+        MPS has no float64 and keeps float32.
         """
         rad_values = (f0_values / self.sampling_rate) % 1
-        phase = torch.cumsum(rad_values, dim=1) * (2 * np.pi)
+        dtype = torch.float32 if f0_values.device.type == "mps" else torch.float64
+        cycles = torch.cumsum(rad_values.to(dtype), dim=1) % 1
+        phase = cycles.to(f0_values.dtype) * (2 * np.pi)
         if initial_phase is not None:
             phase = initial_phase + phase
 
@@ -557,135 +547,3 @@ class Decoder(nn.Module):
                          for j in range(gen.num_kernels)) * jump
         reach += radius(gen.conv_post) * jump + gen.stft.n_fft / samples_per_asr
         return math.ceil(reach) + 1
-
-    @torch.inference_mode()
-    def forward_chunk(self, asr, F0_curve, N, s, state=None, *, final=False):
-        """Return (stable_audio, state), with audio shaped [batch, 1, samples].
-
-        Pass the returned state on every call. Symmetric convolutions require
-        lookahead, so early calls can return empty audio. Use final=True on the
-        last input, or finish through StreamingDecoder.flush(). Phase alone is
-        insufficient: state also retains bounded input and excitation context.
-        """
-        if self.training:
-            raise ValueError("Streaming requires decoder.eval()")
-        state = DecoderStreamState() if state is None else state
-        if state.finished:
-            raise ValueError("The decoder stream is finished; start a new state")
-        if (asr.ndim != 3 or F0_curve.ndim != 2 or N.ndim != 2 or s.ndim != 2
-                or F0_curve.shape != N.shape
-                or F0_curve.shape != (asr.shape[0], asr.shape[-1] * 2)
-                or s.shape[0] != asr.shape[0] or asr.shape[-1] == 0):
-            raise ValueError("Expected nonempty ASR [B,C,T], F0/energy [B,2*T], style [B,S]")
-        if any(t.device != asr.device or t.dtype != asr.dtype for t in (F0_curve, N, s)):
-            raise ValueError("All streaming inputs must share device and dtype")
-        if state.asr is not None:
-            if (asr.shape[:2] != state.asr.shape[:2] or asr.device != state.asr.device
-                    or asr.dtype != state.asr.dtype or not torch.equal(s, state.style)):
-                raise ValueError("Batch, device, dtype and style must stay fixed; reset the stream")
-        source, state.phase = self.generator.source(F0_curve, state.phase)
-        for name, value in (("asr", asr), ("f0", F0_curve), ("energy", N), ("source", source)):
-            previous = getattr(state, name)
-            setattr(state, name, value.clone() if previous is None else torch.cat([previous, value], dim=-1))
-        if state.style is None:
-            state.style = s.clone()
-        state.total_frames += asr.shape[-1]
-        return self._drain_stream(state, final=final), state
-
-    def _drain_stream(self, state, *, final):
-        samples_per_asr = 2 * int(self.generator.total_upsample)
-        context = self.streaming_context_frames()
-        end_frame = state.total_frames if final else max(0, state.total_frames - context)
-        end_sample = end_frame * samples_per_asr
-        if end_sample > state.emitted_samples:
-            audio = self.inference(state.asr, state.f0, state.energy, state.style, source=state.source)
-            start = state.emitted_samples - state.start_frame * samples_per_asr
-            end = end_sample - state.start_frame * samples_per_asr
-            if end > audio.shape[-1]:
-                raise RuntimeError("Decoder output length does not match its upsample factor")
-            result = audio[..., start:end].clone()
-            state.emitted_samples = end_sample
-        else:
-            result = state.asr.new_empty(state.asr.shape[0], 1, 0)
-        if final:
-            state.finished = True
-            state.asr = state.f0 = state.energy = state.source = None
-        else:
-            # Clone slices so a small retained window cannot hold an entire
-            # utterance's backing storage alive.
-            drop = max(0, end_frame - context - state.start_frame)
-            if drop:
-                state.asr = state.asr[..., drop:].clone()
-                state.f0 = state.f0[..., 2 * drop:].clone()
-                state.energy = state.energy[..., 2 * drop:].clone()
-                state.source = state.source[..., drop * samples_per_asr:].clone()
-                state.start_frame += drop
-        return result
-
-
-class StreamingDecoder(nn.Module):
-    """Bounded-context streaming for an eval-mode Decoder.
-
-    step() accepts up to chunk_asr_frames ASR frames (including a short final
-    chunk) and may return empty audio during lookahead. Concatenate all step()
-    outputs and flush() exactly once to recover the complete aligned utterance.
-    Lookahead is exposed as lookahead_samples; reset() starts another utterance.
-
-    reset(skip_samples=...) drops leading output, typically the BOS silence:
-    pred_dur[0] * samples_per_asr_frame minus a short margin. Those frames are
-    still decoded as left context, so the speech onset is unchanged.
-    """
-    def __init__(self, decoder: Decoder, chunk_asr_frames: int = 40):
-        super().__init__()
-        if not isinstance(chunk_asr_frames, int) or chunk_asr_frames < 1:
-            raise ValueError("chunk_asr_frames must be a positive integer")
-        self.decoder = decoder
-        self.chunk_asr_frames = chunk_asr_frames
-        self.chunk_f0_frames = chunk_asr_frames * 2
-        self.samples_per_asr_frame = 2 * int(decoder.generator.total_upsample)
-        self.chunk_audio_samples = chunk_asr_frames * self.samples_per_asr_frame
-        self.lookahead_samples = decoder.streaming_context_frames() * self.samples_per_asr_frame
-        self.reset()
-
-    def reset(self, skip_samples: int = 0, fade_samples: int = 120):
-        """Start an utterance; skip_samples > 0 trims leading output and ramps in
-        the next fade_samples (120 = 5 ms at 24 kHz) to avoid a click."""
-        if skip_samples < 0 or fade_samples < 0:
-            raise ValueError("skip_samples and fade_samples must be nonnegative")
-        self.state = None
-        self.skip_left = int(skip_samples)
-        self.fade_samples = int(fade_samples) if skip_samples else 0
-        self.fade_done = 0
-
-    def _trim(self, audio):
-        if self.skip_left:
-            skip = min(self.skip_left, audio.shape[-1])
-            audio = audio[..., skip:]
-            self.skip_left -= skip
-        if self.fade_done < self.fade_samples and audio.shape[-1]:
-            count = min(self.fade_samples - self.fade_done, audio.shape[-1])
-            ramp = torch.arange(self.fade_done + 1, self.fade_done + count + 1,
-                                device=audio.device, dtype=audio.dtype) / self.fade_samples
-            audio = torch.cat([audio[..., :count] * ramp, audio[..., count:]], dim=-1)
-            self.fade_done += count
-        return audio
-
-    @torch.inference_mode()
-    def step(self, asr_chunk, f0_chunk, energy_chunk, s):
-        if asr_chunk.shape[-1] > self.chunk_asr_frames:
-            raise ValueError("Input exceeds chunk_asr_frames")
-        audio, self.state = self.decoder.forward_chunk(
-            asr_chunk, f0_chunk, energy_chunk, s, self.state,
-        )
-        return self._trim(audio.squeeze(1))
-
-    @torch.inference_mode()
-    def flush(self):
-        """Emit the remaining real samples, including the utterance's right edge."""
-        if self.state is None:
-            raise ValueError("Call step() before flush()")
-        if self.state.finished:
-            return self.state.style.new_empty(self.state.style.shape[0], 0)
-        if self.decoder.training:
-            raise ValueError("Streaming requires decoder.eval()")
-        return self._trim(self.decoder._drain_stream(self.state, final=True).squeeze(1))

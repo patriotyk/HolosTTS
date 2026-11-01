@@ -1,11 +1,14 @@
 [build-system]
-requires = ["setuptools>=62.6.0"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "holos-tts"
-version = "0.2"
-description = "Holos TTS inference package"
+version = "0.3"
+description = "HolosTTS text-to-speech on PyTorch"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.8"
 dynamic = ["dependencies"]
 

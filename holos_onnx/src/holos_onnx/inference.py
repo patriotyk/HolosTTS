@@ -555,19 +555,31 @@ class HolosTTS:
         frame_count: int,
         chunk_frames: int,
         context_frames: int,
+        fixed_width: bool = False,
     ) -> Iterator[Tuple[int, int, int, int]]:
         """Yield ``(start, end, window_start, window_end)`` for each chunk.
 
         Every chunk gets ``context_frames`` of real context on both sides, or
         reaches the utterance edge, so the chunks concatenate to the
-        whole-utterance audio. Windows are shifted inside the utterance
-        rather than padded.
+        whole-utterance audio. Windows stop at the utterance edges, so the
+        first and last ones are shorter: the first chunk, which sets the time
+        to first audio, decodes ``chunk_frames + context_frames`` frames.
+
+        With ``fixed_width`` every window is ``chunk_frames + 2 *
+        context_frames`` wide (or the whole utterance), shifted inside it at
+        the edges. The CUDA execution provider re-plans its convolutions
+        whenever the input shape changes, about 30 ms per change for this
+        decoder, far more than decoding the extra frames.
         """
-        window = chunk_frames + 2 * context_frames
+        width = chunk_frames + 2 * context_frames
         for start in range(0, frame_count, chunk_frames):
             end = min(start + chunk_frames, frame_count)
-            window_start = max(0, min(start - context_frames, frame_count - window))
-            yield start, end, window_start, min(window_start + window, frame_count)
+            window_start = max(0, start - context_frames)
+            window_end = min(frame_count, end + context_frames)
+            if fixed_width:
+                window_start = max(0, min(window_start, frame_count - width))
+                window_end = min(frame_count, window_start + width)
+            yield start, end, window_start, window_end
 
     def _decode_windows(self, encoded: _Encoded, chunk_frames: Optional[int]) -> Iterator[np.ndarray]:
         maximum = int(self.streaming["chunk_frames"])
@@ -579,7 +591,10 @@ class HolosTTS:
         step = self.samples_per_frame
         (source,) = self.source_session.run(["source"], {"f0": encoded.f0})
         for start, end, window_start, window_end in self._stream_windows(
-            encoded.frame_to_token.size, chunk_frames, context_frames,
+            encoded.frame_to_token.size,
+            chunk_frames,
+            context_frames,
+            fixed_width=self.decoder_session.get_providers()[0] in _GPU_PROVIDERS,
         ):
             (audio,) = self.decoder_session.run(
                 ["audio"],

@@ -265,14 +265,14 @@ class _FakeWindowDecoderSession:
 
 
 class StreamingBundleTest(unittest.TestCase):
-    def test_windows_cover_each_frame_once_with_full_context(self):
+    def test_windows_cover_each_frame_once_with_exact_context(self):
         for frame_count in (1, 5, 8, 9, 23, 64):
             covered = []
             for start, end, window_start, window_end in HolosTTS._stream_windows(frame_count, 4, 2):
                 covered.extend(range(start, end))
-                self.assertLessEqual(window_end - window_start, 8)
-                self.assertTrue(window_start == 0 or start - window_start >= 2)
-                self.assertTrue(window_end == frame_count or window_end - end >= 2)
+                # Just the needed context, cut at the utterance edges.
+                self.assertEqual(window_start, max(0, start - 2))
+                self.assertEqual(window_end, min(frame_count, end + 2))
             self.assertEqual(covered, list(range(frame_count)))
 
     def _runtime(self):
@@ -299,9 +299,18 @@ class StreamingBundleTest(unittest.TestCase):
         # Six tokens x 3 frames = 18 frames in chunks of 4.
         self.assertEqual([chunk.size // 600 for chunk in chunks], [4, 4, 4, 4, 2])
         np.testing.assert_array_equal(np.concatenate(chunks), np.arange(18 * 600, dtype=np.float32))
-        self.assertEqual(set(self.decoder.widths), {8})
+        # The first window has no left context and the last none on the right.
+        self.assertEqual(self.decoder.widths, [6, 8, 8, 8, 4])
         result = runtime.generate_with_details("aaaa", voice="test")
         self.assertEqual(result.audio_length, 18 * 600)
+
+    def test_gpu_windows_keep_one_width(self):
+        runtime = self._runtime()
+        self.decoder.get_providers = lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        chunks = list(runtime.stream("aaaa", voice="test", trim_silence=False))
+
+        np.testing.assert_array_equal(np.concatenate(chunks), np.arange(18 * 600, dtype=np.float32))
+        self.assertEqual(self.decoder.widths, [8, 8, 8, 8, 8])
 
     def test_stream_trims_boundary_silence_with_fade_in(self):
         runtime = self._runtime()
