@@ -46,11 +46,11 @@ model = HolosTTS("patriotyk/HolosTTS", device=device)
 
 print(model.list_voices())
 voice = model.list_voices()[0]
-audio = model.generate(phonemes, voice=voice)
+audio = model.generate(phonemes, voice=voice, speed=1.0)
 sf.write("speech.wav", audio.squeeze().cpu().numpy(), 24000)
 ```
 
-For local files, use `HolosTTS("holos.pt", device=device, voices_path="voices.pt")`.
+`speed` above one speaks faster, below one slower. For local files, use `HolosTTS("holos.pt", device=device, voices_path="voices.pt")`.
 
 ### Streaming
 

@@ -1,3 +1,4 @@
+import math
 import os
 import torch
 import numpy as np
@@ -145,12 +146,13 @@ class HolosTTS(nn.Module):
         return list(self.voices.keys())
     
     @torch.inference_mode()
-    def generate(self, text: str, voice: Union[str, torch.Tensor]) -> torch.Tensor:
-        return self.forward(*self._prepare_inputs(text, voice))
+    def generate(self, text: str, voice: Union[str, torch.Tensor], speed: float = 1.0) -> torch.Tensor:
+        """speed above one speaks faster, below one slower."""
+        return self.forward(*self._prepare_inputs(text, voice), speed=speed)
 
     @torch.inference_mode()
-    def stream(self, text: str, voice: Union[str, torch.Tensor], chunk_frames: int = 40,
-               trim_silence: bool = True) -> Iterator[torch.Tensor]:
+    def stream(self, text: str, voice: Union[str, torch.Tensor], speed: float = 1.0,
+               chunk_frames: int = 40, trim_silence: bool = True) -> Iterator[torch.Tensor]:
         """Yield audio [batch, samples] chunk by chunk; concatenated, the chunks
         equal generate() (with trim_silence=False and the same source noise).
 
@@ -162,7 +164,7 @@ class HolosTTS(nn.Module):
         trim_silence drops the boundary-token silence at the start (about 50 ms)
         except a 10 ms margin and fades in over 5 ms.
         """
-        aligned, f0, energy, voice_acoustic, _, pred_dur = self._encode(*self._prepare_inputs(text, voice))
+        aligned, f0, energy, voice_acoustic, _, pred_dur = self._encode(*self._prepare_inputs(text, voice), speed=speed)
         chunks = self._decode_windows(aligned, f0, energy, voice_acoustic, chunk_frames)
         if not trim_silence:
             yield from chunks
@@ -238,12 +240,15 @@ class HolosTTS(nn.Module):
     
     
     @torch.no_grad()
-    def encode(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor):
+    def encode(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor, speed: float = 1.0):
         """Encoder part: text → aligned features, f0, energy. No decoder."""
-        return self._encode(tokens, voice, input_lengths)[:5]
+        return self._encode(tokens, voice, input_lengths, speed)[:5]
 
-    def _encode(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor):
+    def _encode(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor, speed: float = 1.0):
         """encode() plus the predicted per-token durations in frames."""
+        speed = float(speed)
+        if not math.isfinite(speed) or speed <= 0:
+            raise ValueError("speed must be a positive finite number")
         voice_acoustic = voice[:, :128]
         voice_prosodic = voice[:, 128:]
         
@@ -252,7 +257,7 @@ class HolosTTS(nn.Module):
         
         d = self.duration_predictor(d_en, voice_prosodic, input_lengths)
 
-        duration = torch.sigmoid(d).sum(axis=-1) / 1.0
+        duration = torch.sigmoid(d).sum(axis=-1) / speed
         pred_dur = torch.round(duration).long()[0]
 
         pred_aln_trg = self.onnx_alignment(pred_dur, d_en.size(1))
@@ -267,7 +272,8 @@ class HolosTTS(nn.Module):
 
 
     @torch.no_grad()
-    def forward(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor) -> torch.Tensor:
-        encoded = self.encode(tokens, voice, input_lengths)
+    def forward(self, tokens: torch.Tensor, voice: torch.Tensor, input_lengths: torch.Tensor,
+                speed: float = 1.0) -> torch.Tensor:
+        encoded = self.encode(tokens, voice, input_lengths, speed)
         wave = self.decoder(*encoded)
         return wave.squeeze(0)

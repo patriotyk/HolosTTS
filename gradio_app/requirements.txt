@@ -1,0 +1,8 @@
+# The demo app is not published; install it from the repository root with:
+#   pip install -e . -r gradio_app/requirements.txt
+gradio
+ukrainian-word-stress @ git+https://github.com/patriotyk/ukrainian-word-stress.git
+ipa-uk @ git+https://github.com/patriotyk/ipa-uk.git
+# The "Verbalize" button
+ctranslate2
+sentencepiece
