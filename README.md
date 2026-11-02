@@ -1,6 +1,6 @@
 # HolosTTS
 
-HolosTTS is an open-source Ukrainian text-to-speech model, with the best balance of quality and speed (the first audio chunk in 5 ms on an RTX 3090). It has preset voices and clones a voice from an audio sample. It produces mono audio at **24 kHz** and supports streaming. It runs on PyTorch, or on ONNX Runtime without PyTorch: CPU (including INT8), CUDA and TensorRT.
+HolosTTS is an open-source Ukrainian text-to-speech model, with the best balance of quality and speed (the first audio chunk in 3ms on an RTX 5090 or in 5ms on RTX 3090). It has preset voices and clones a voice from an audio sample. It produces mono audio at **24 kHz** and supports streaming. It runs on PyTorch, or on ONNX Runtime without PyTorch: CPU (including INT8), CUDA and TensorRT.
 
 [Demo](https://huggingface.co/spaces/patriotyk/HolosTTS) · [Models on Hugging Face](https://huggingface.co/patriotyk/HolosTTS) · [Code on GitHub](https://github.com/patriotyk/HolosTTS)
 
@@ -96,6 +96,17 @@ See the [package README](https://github.com/patriotyk/HolosTTS/blob/main/holos_o
 - **First audio** is the delay a listener notices: for HolosTTS, the first chunk of streaming with `stream()`. The models marked * do not stream within a sentence, so their first audio is the whole sentence.
 
 Three sentences of 5–12 s of speech, the median of 10 runs (5 on CPU) after a warm-up; the first audio is averaged over the sentences. Every sample says "Будь ласка, зателефонуйте мені завтра після обіду, коли матимете вільну хвилинку."
+
+### NVIDIA RTX 5090
+
+Only HolosTTS so far; the samples are in the RTX 3090 table.
+
+| Model | Runtime | RTF | First audio |
+| --- | --- | --- | --- |
+| **HolosTTS** | **ONNX, TensorRT FP16** | **0.0005** | **3 ms** |
+| **HolosTTS** | **ONNX, TensorRT FP32** | **0.0012** | **6 ms** |
+| **HolosTTS** | **ONNX, CUDA** | **0.0019** | **11 ms** |
+| **HolosTTS** | **PyTorch** | **0.0094** | **58 ms** |
 
 ### NVIDIA RTX 3090
 

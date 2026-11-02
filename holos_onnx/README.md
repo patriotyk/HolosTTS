@@ -93,7 +93,7 @@ the chunks concatenate to the same audio as decoding the whole utterance. On
 CPU the windows at the utterance edges are shorter, so the first chunk decodes
 fewer frames; on GPU every window has the full width, since a new input shape
 costs the CUDA provider more than the extra frames. The first chunk is ready
-after about 5 ms with TensorRT FP16 on an RTX 3090, or about 200 ms in INT8 on
+after about 3 ms with TensorRT FP16 on an RTX 5090, or about 200 ms in INT8 on
 an Apple M2 CPU; see the
 [benchmarks](https://github.com/patriotyk/HolosTTS#benchmarks). When the whole
 phrase can be generated before playback, `generate` without streaming is
