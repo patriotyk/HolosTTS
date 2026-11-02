@@ -1,0 +1,65 @@
+name: Publish holos-tts-mlx
+
+# Push a tag such as mlx-v0.1 that matches the version in
+# holos_mlx/pyproject.toml.
+on:
+  push:
+    tags:
+      - "mlx-v*"
+
+jobs:
+  build:
+    # MLX has wheels for Apple silicon; macos-latest runs on it.
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: holos_mlx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check that the tag matches the package version
+        run: |
+          python - <<'EOF'
+          import os, tomllib
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("mlx-v")
+          if tag != version:
+              raise SystemExit(f"Tag mlx-v{tag} does not match holos_mlx/pyproject.toml version {version}")
+          EOF
+      - name: Test
+        # The tests need no checkpoint. They run on MLX's CPU device, since
+        # the hosted runners may have no Metal GPU.
+        run: |
+          python -m pip install mlx numpy huggingface-hub
+          python - <<'EOF'
+          import runpy, sys
+          import mlx.core as mx
+          mx.set_default_device(mx.cpu)
+          sys.argv = ["test_layers.py", "-v"]
+          runpy.run_path("tests/test_layers.py", run_name="__main__")
+          EOF
+      - name: Build
+        run: |
+          python -m pip install build
+          python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: holos_mlx/dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/holos-tts-mlx
+    permissions:
+      id-token: write  # PyPI trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

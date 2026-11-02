@@ -1,6 +1,6 @@
 # HolosTTS
 
-HolosTTS is an open-source Ukrainian text-to-speech model, with the best balance of quality and speed (the first audio chunk in 3 ms on an RTX 5090 or in 5 ms on an RTX 3090). It has preset voices and clones a voice from an audio sample. It produces mono audio at **24 kHz** and supports streaming. It runs on PyTorch, or on ONNX Runtime without PyTorch: CPU (including INT8), CUDA and TensorRT.
+HolosTTS is an open-source Ukrainian text-to-speech model, with the best balance of quality and speed (the first audio chunk in 3 ms on an RTX 5090 or in 5 ms on an RTX 3090). It has preset voices and clones a voice from an audio sample. It produces mono audio at **24 kHz** and supports streaming. It runs on PyTorch, or without PyTorch on ONNX Runtime (CPU including INT8, CUDA and TensorRT) and on MLX on Apple silicon.
 
 [Demo](https://huggingface.co/spaces/patriotyk/HolosTTS) · [Models on Hugging Face](https://huggingface.co/patriotyk/HolosTTS) · [Code on GitHub](https://github.com/patriotyk/HolosTTS)
 
@@ -8,6 +8,7 @@ HolosTTS is an open-source Ukrainian text-to-speech model, with the best balance
 | --- | --- |
 | [`holos-tts`](https://pypi.org/project/holos-tts/) | PyTorch inference and voice cloning. |
 | [`holos-tts-onnx`](https://pypi.org/project/holos-tts-onnx/) | ONNX Runtime inference without PyTorch: CPU, CUDA, TensorRT. |
+| [`holos-tts-mlx`](https://pypi.org/project/holos-tts-mlx/) | MLX inference without PyTorch on Apple silicon. |
 
 ## Phonemes
 
@@ -90,6 +91,16 @@ python -m pip install "holos-tts-onnx[tensorrt]"  # plus TensorRT
 
 See the [package README](https://github.com/patriotyk/HolosTTS/blob/main/holos_onnx/README.md) for usage, the models and GPU setup.
 
+## MLX (Apple silicon)
+
+`holos-tts-mlx` runs the whole model on the GPU of a Mac with [MLX](https://github.com/ml-explore/mlx), in FP32 and without PyTorch, with the same streaming. It is the fastest option on a Mac and loads in a fraction of a second.
+
+```bash
+python -m pip install holos-tts-mlx
+```
+
+See the [package README](https://github.com/patriotyk/HolosTTS/blob/main/holos_mlx/README.md) for usage.
+
 ## Benchmarks
 
 - **RTF** (real-time factor) is for synthesizing a whole sentence (`generate()` in HolosTTS): the time it takes divided by the duration of the audio. 0.01 means one second of speech in 10 ms; lower is faster.
@@ -139,6 +150,7 @@ Only HolosTTS so far; the samples are in the RTX 3090 table.
 
 | Model | Runtime | RTF | First audio | Sample |
 | --- | --- | --- | --- | --- |
+| **HolosTTS** | **MLX (GPU)** | **0.025** | **66 ms** | <audio controls preload="none" src="https://huggingface.co/patriotyk/HolosTTS/resolve/main/samples/holos-mlx-m2.wav"><a href="https://huggingface.co/patriotyk/HolosTTS/blob/main/samples/holos-mlx-m2.wav">Listen</a></audio> |
 | **HolosTTS** | **ONNX INT8** | **0.086** | **204 ms** | <audio controls preload="none" src="https://huggingface.co/patriotyk/HolosTTS/resolve/main/samples/holos-onnx-int8-m2.wav"><a href="https://huggingface.co/patriotyk/HolosTTS/blob/main/samples/holos-onnx-int8-m2.wav">Listen</a></audio> |
 | **HolosTTS** | **PyTorch (CPU)** | **0.107** | **351 ms** | <audio controls preload="none" src="https://huggingface.co/patriotyk/HolosTTS/resolve/main/samples/holos-pytorch-m2.wav"><a href="https://huggingface.co/patriotyk/HolosTTS/blob/main/samples/holos-pytorch-m2.wav">Listen</a></audio> |
 | **HolosTTS** | **ONNX FP32** | **0.129** | **289 ms** | <audio controls preload="none" src="https://huggingface.co/patriotyk/HolosTTS/resolve/main/samples/holos-onnx-m2.wav"><a href="https://huggingface.co/patriotyk/HolosTTS/blob/main/samples/holos-onnx-m2.wav">Listen</a></audio> |
@@ -156,6 +168,7 @@ python benchmark.py onnx                                        # ONNX FP32 on C
 python benchmark.py onnx --model patriotyk/HolosTTS/onnx-int8   # ONNX INT8 on CPU
 python benchmark.py onnx --provider tensorrt-fp16               # or cuda, tensorrt
 python benchmark.py torch --device cuda                         # PyTorch
+python benchmark.py mlx                                         # MLX on Apple silicon
 ```
 
 ## Files on Hugging Face
@@ -168,6 +181,7 @@ python benchmark.py torch --device cuda                         # PyTorch
 | `samples/` | The audio samples from [Benchmarks](#benchmarks). |
 | `onnx/` | FP32 ONNX model for `holos-tts-onnx`: CPU, CUDA and TensorRT. |
 | `onnx-int8/` | INT8 ONNX model for CPU. |
+| `mlx/` | MLX model for `holos-tts-mlx`: `config.json`, `model.safetensors` and `voices.npz`. |
 
 Each ONNX folder holds `holos_onnx.json` (vocabulary and parameters), `voices.npz` (preset voices) and the model stages: `encoder.onnx`, `prosody.onnx`, `decoder.onnx`, plus `source.onnx` and `decoder_window.onnx` for streaming.
 
