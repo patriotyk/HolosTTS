@@ -9,8 +9,9 @@ on:
 
 jobs:
   build:
-    # MLX has wheels for Apple silicon; macos-latest runs on it.
-    runs-on: macos-latest
+    # The package is pure Python, and MLX's Linux CPU build runs the tests;
+    # hosted macOS runners can wait in the queue for a long time.
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: holos_mlx
@@ -29,10 +30,9 @@ jobs:
               raise SystemExit(f"Tag mlx-v{tag} does not match holos_mlx/pyproject.toml version {version}")
           EOF
       - name: Test
-        # The tests need no checkpoint. They run on MLX's CPU device, since
-        # the hosted runners may have no Metal GPU.
+        # The tests need no checkpoint and run on MLX's CPU device.
         run: |
-          python -m pip install mlx numpy huggingface-hub
+          python -m pip install "mlx[cpu]" numpy huggingface-hub
           python - <<'EOF'
           import runpy, sys
           import mlx.core as mx
