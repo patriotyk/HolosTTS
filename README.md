@@ -1,14 +1,15 @@
 # HolosTTS
 
-HolosTTS is an open-source Ukrainian text-to-speech model, with the best balance of quality and speed (the first audio chunk in 3 ms on an RTX 5090 or in 5 ms on an RTX 3090). It has preset voices and clones a voice from an audio sample. It produces mono audio at **24 kHz** and supports streaming. It runs on PyTorch, or without PyTorch on ONNX Runtime (CPU including INT8, CUDA and TensorRT), on MLX on Apple silicon and on Android GPUs with LiteRT.
+HolosTTS is an open-source Ukrainian text-to-speech model, with the best balance of quality and speed (the first audio chunk in 3 ms on an RTX 5090 or in 5 ms on an RTX 3090). It has preset voices and clones a voice from an audio sample. It produces mono audio at **24 kHz** and supports streaming. It runs on PyTorch, or without PyTorch on ONNX Runtime (CPU including INT8, CUDA and TensorRT), on MLX on Apple silicon, and on Android: on the GPU with LiteRT or on the CPU with ONNX Runtime.
 
 [Demo](https://huggingface.co/spaces/patriotyk/HolosTTS) · [Models on Hugging Face](https://huggingface.co/patriotyk/HolosTTS) · [Code on GitHub](https://github.com/patriotyk/HolosTTS)
 
-| Package | Use |
+| Python package | Use |
 | --- | --- |
 | [`holos-tts`](https://pypi.org/project/holos-tts/) | PyTorch inference and voice cloning. |
 | [`holos-tts-onnx`](https://pypi.org/project/holos-tts-onnx/) | ONNX Runtime inference without PyTorch: CPU, CUDA, TensorRT. |
 | [`holos-tts-mlx`](https://pypi.org/project/holos-tts-mlx/) | MLX inference without PyTorch on Apple silicon. |
+| [`holos-tts-litert`](https://pypi.org/project/holos-tts-litert/) | LiteRT inference on CPU or GPU, the reference for the Android library. |
 
 ## Phonemes
 
