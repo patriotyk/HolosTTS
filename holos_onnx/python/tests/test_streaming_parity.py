@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from holos_onnx import inference  # noqa: E402
 from holos_onnx.inference import HolosTTS  # noqa: E402
 
-SHARED = Path(__file__).resolve().parents[2] / "holos" / "streaming.py"
+SHARED = Path(__file__).resolve().parents[3] / "holos" / "streaming.py"
 
 
 def _load_shared():

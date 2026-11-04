@@ -1,0 +1,17 @@
+plugins {
+    id "com.android.library"
+}
+
+android {
+    namespace "com.holos.tts.onnx"
+    compileSdk 37
+
+    defaultConfig {
+        minSdk 29
+        consumerProguardFiles "consumer-rules.pro"
+    }
+}
+
+dependencies {
+    api "com.microsoft.onnxruntime:onnxruntime-android:1.31.1"
+}

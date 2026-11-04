@@ -7,7 +7,7 @@ sides; the chunks then concatenate to the whole-utterance audio.
 
 This module has no torch dependency. The holos-onnx runtime keeps a copy of
 these functions (it cannot import holos without torch); the tests in
-holos_onnx/tests/test_streaming_parity.py check that both behave the same.
+holos_onnx/python/tests/test_streaming_parity.py check that both behave the same.
 """
 
 from typing import Iterator, Tuple

@@ -1,7 +1,7 @@
 name: Publish holos-tts-onnx
 
 # Push a tag such as onnx-v0.2.0 that matches the version in
-# holos_onnx/pyproject.toml.
+# holos_onnx/python/pyproject.toml.
 on:
   push:
     tags:
@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: holos_onnx
+        working-directory: holos_onnx/python
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,7 +25,7 @@ jobs:
           version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
           tag = os.environ["GITHUB_REF_NAME"].removeprefix("onnx-v")
           if tag != version:
-              raise SystemExit(f"Tag onnx-v{tag} does not match holos_onnx/pyproject.toml version {version}")
+              raise SystemExit(f"Tag onnx-v{tag} does not match holos_onnx/python/pyproject.toml version {version}")
           EOF
       - name: Test
         # The CPU onnxruntime is enough: the tests use fake sessions. The
@@ -41,7 +41,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: holos_onnx/dist/
+          path: holos_onnx/python/dist/
 
   publish:
     needs: build

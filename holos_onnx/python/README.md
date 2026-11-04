@@ -1,7 +1,8 @@
 # holos-tts-onnx
 
 PyTorch-free inference for HolosTTS on ONNX Runtime: CPU, CUDA and TensorRT,
-with optional low-latency streaming.
+with optional low-latency streaming. A Kotlin port for Android is in
+[`holos_onnx/kotlin/`](https://github.com/patriotyk/HolosTTS/tree/main/holos_onnx/kotlin).
 
 ## Install
 
@@ -10,7 +11,7 @@ python -m pip install holos-tts-onnx              # CPU and CUDA
 python -m pip install "holos-tts-onnx[tensorrt]"  # plus TensorRT
 ```
 
-From a checkout of the repository, install `./holos_onnx` instead. The import
+From a checkout of the repository, install `./holos_onnx/python` instead. The import
 name is `holos_onnx`.
 
 On Linux and Windows this installs `onnxruntime-gpu` with its CUDA and cuDNN
@@ -128,10 +129,10 @@ stage would slow the next one down on CPU.
 ## Tests
 
 ```bash
-python holos_onnx/tests/test_inference.py
-python holos_onnx/tests/test_streaming_parity.py  # needs the repository checkout
+python holos_onnx/python/tests/test_inference.py
+python holos_onnx/python/tests/test_streaming_parity.py  # needs the repository checkout
 ```
 
 ## License
 
-MIT, see [LICENSE](https://github.com/patriotyk/HolosTTS/blob/main/holos_onnx/LICENSE).
+MIT, see [LICENSE](https://github.com/patriotyk/HolosTTS/blob/main/holos_onnx/python/LICENSE).

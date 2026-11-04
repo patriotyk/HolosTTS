@@ -89,7 +89,9 @@ python -m pip install holos-tts-onnx              # CPU and CUDA
 python -m pip install "holos-tts-onnx[tensorrt]"  # plus TensorRT
 ```
 
-See the [package README](https://github.com/patriotyk/HolosTTS/blob/main/holos_onnx/README.md) for usage, the models and GPU setup.
+See the [package README](https://github.com/patriotyk/HolosTTS/blob/main/holos_onnx/python/README.md) for usage, the models and GPU setup.
+
+For Android, [`holos_onnx/kotlin/`](https://github.com/patriotyk/HolosTTS/tree/main/holos_onnx/kotlin) has a Kotlin port of this package with a demo app. It runs the same bundles on the phone's CPU, INT8 being the faster one there. See its [README](https://github.com/patriotyk/HolosTTS/blob/main/holos_onnx/kotlin/README.md) for usage.
 
 ## MLX (Apple silicon)
 
@@ -103,7 +105,7 @@ See the [package README](https://github.com/patriotyk/HolosTTS/blob/main/holos_m
 
 ## Android (LiteRT GPU)
 
-The [`holos_litert/kotlin/`](https://github.com/patriotyk/HolosTTS/tree/main/holos_litert/kotlin) folder has a library that runs the model on the phone's GPU with [LiteRT](https://ai.google.dev/edge/litert), and a demo app. On a Pixel 7 it synthesizes with an RTF of 0.13 and gives the first streaming chunk in about 0.4 s. See its [README](https://github.com/patriotyk/HolosTTS/blob/main/holos_litert/kotlin/README.md) for usage.
+The [`holos_litert/kotlin/`](https://github.com/patriotyk/HolosTTS/tree/main/holos_litert/kotlin) folder has a library that runs the model on the phone's GPU with [LiteRT](https://ai.google.dev/edge/litert), and a demo app. On a Pixel 7 it synthesizes with an RTF of 0.13 and gives the first streaming chunk in about 0.4 s. See its [README](https://github.com/patriotyk/HolosTTS/blob/main/holos_litert/kotlin/README.md) for usage. On phones without a suitable GPU, the [ONNX library](https://github.com/patriotyk/HolosTTS/tree/main/holos_onnx/kotlin) runs on the CPU.
 
 The same model also runs in Python, in the `holos-tts-litert` package from [`holos_litert/python/`](https://github.com/patriotyk/HolosTTS/tree/main/holos_litert/python) (`pip install holos-tts-litert`). I use it to check the model on a computer and as the reference for the ports.
 

@@ -1,0 +1,20 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.holos.demo"
+    compileSdk 37
+
+    defaultConfig {
+        applicationId "com.holos.demo.onnx"
+        minSdk 29
+        targetSdk 37
+        versionCode 1
+        versionName "1.0"
+    }
+}
+
+dependencies {
+    implementation project(":holos-onnx")
+}
