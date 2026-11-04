@@ -19,7 +19,7 @@ The 10 s sentence from the main [Benchmarks](../../README.md#benchmarks), on the
 | Loading the first time (compiling for the GPU) | about 9 s |
 | GPU memory | about 690 MB |
 
-For comparison, the INT8 ONNX model on the CPU of the same phone gives its first chunk in about 0.63 s and streams with an RTF of about 0.37.
+For comparison, the INT8 ONNX model on the CPU of the same phone, with the [ONNX library](../../holos_onnx/kotlin/README.md), gives its first chunk in about 0.7 s and streams with an RTF of about 0.4.
 
 ## The model
 

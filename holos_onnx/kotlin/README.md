@@ -23,9 +23,19 @@ On a phone I use the INT8 bundle from the [`onnx-int8/`](https://huggingface.co/
 
 The streaming files of `onnx-int8/` take 320 MB. One utterance can have up to 1000 frames (25 s of speech), so synthesize long texts sentence by sentence.
 
-## Speed
+## Speed on a Pixel 7
 
-I have not measured the library on a phone yet. When I measured the stages of the INT8 bundle one by one on the CPU of a Pixel 7, with 4 threads, the first chunk of a stream took about 0.63 s and the stream had an RTF of about 0.37. LiteRT on the GPU of the same phone gives 0.4 s and 0.13.
+A sentence of 10.3 s with the INT8 bundle, on the CPU with ONNX Runtime's default threads:
+
+| Metric | Value |
+| --- | --- |
+| First chunk of `stream()` | about 0.7 s |
+| RTF of `stream()` and of `generate()` with `streaming = true` | about 0.4 |
+| RTF of `generate()` with `streaming = false` | about 0.23 |
+| Loading | 1.5–1.8 s |
+| Memory (PSS) | about 430 MB loaded, 650–750 MB while synthesizing |
+
+4 threads are as fast as the default. Chunks of 20 frames bring the first chunk only about 50 ms sooner, because most of that time goes to the encoder. A phone gets hot under this load, and once it throttles, the RTF grows to about 0.5. LiteRT on the GPU of the same phone gives the first chunk in 0.4 s and an RTF of 0.13. The audio on the phone is the same as on a computer, sample for sample.
 
 ## Usage
 
@@ -62,7 +72,7 @@ tts.close()
 - **Voices:** `getVoice(name)` returns a preset voice vector, and `encode()` also takes a vector, so voices can be mixed or cloned on a computer. `generate()` and `stream()` take what `encode()` returns.
 - **Streaming:** each chunk of 40 frames (1 s) is decoded with 20 frames of context on both sides, so the chunks join into the `generate()` audio. `stream(encoded, chunkFrames)` takes smaller chunks, down to one frame, for the first audio sooner. `stream()` drops the boundary-token silence at the start except 10 ms and fades in over 5 ms, unless `trimSilence = false`.
 - **Without streaming:** `HolosOnnx(bundle, streaming = false)` loads `decoder.onnx` instead of the window decoder. `generate()` then decodes the utterance in one call, about twice as fast, since the windows decode their context again. `stream()` is not available.
-- **Threads:** by default ONNX Runtime picks the number of threads. The third argument takes your own `OrtSession.SessionOptions`, for example with `setIntraOpNumThreads(4)` or an execution provider. Run the synthesis off the main thread.
+- **Threads:** by default ONNX Runtime picks the number of threads, which on a Pixel 7 is as fast as 4. The third argument takes your own `OrtSession.SessionOptions`, for example with `setIntraOpNumThreads(4)` or an execution provider. Run the synthesis off the main thread.
 - **Java:** the same calls work from Java, with `getVoices()`, `getSampleRate()` and the overloads of the optional arguments.
 
 ## Building the demo
