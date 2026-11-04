@@ -1,0 +1,25 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.holos.demo"
+    compileSdk 37
+
+    defaultConfig {
+        applicationId "com.holos.demo"
+        minSdk 29
+        targetSdk 37
+        versionCode 1
+        versionName "1.0"
+    }
+
+    packaging {
+        // LiteRT loads its GPU accelerator library by file name.
+        jniLibs.useLegacyPackaging = true
+    }
+}
+
+dependencies {
+    implementation project(":holos-litert")
+}

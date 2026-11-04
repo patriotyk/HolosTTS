@@ -1,6 +1,6 @@
 # HolosTTS
 
-HolosTTS is an open-source Ukrainian text-to-speech model, with the best balance of quality and speed (the first audio chunk in 3 ms on an RTX 5090 or in 5 ms on an RTX 3090). It has preset voices and clones a voice from an audio sample. It produces mono audio at **24 kHz** and supports streaming. It runs on PyTorch, or without PyTorch on ONNX Runtime (CPU including INT8, CUDA and TensorRT) and on MLX on Apple silicon.
+HolosTTS is an open-source Ukrainian text-to-speech model, with the best balance of quality and speed (the first audio chunk in 3 ms on an RTX 5090 or in 5 ms on an RTX 3090). It has preset voices and clones a voice from an audio sample. It produces mono audio at **24 kHz** and supports streaming. It runs on PyTorch, or without PyTorch on ONNX Runtime (CPU including INT8, CUDA and TensorRT), on MLX on Apple silicon and on Android GPUs with LiteRT.
 
 [Demo](https://huggingface.co/spaces/patriotyk/HolosTTS) · [Models on Hugging Face](https://huggingface.co/patriotyk/HolosTTS) · [Code on GitHub](https://github.com/patriotyk/HolosTTS)
 
@@ -101,6 +101,12 @@ python -m pip install holos-tts-mlx
 
 See the [package README](https://github.com/patriotyk/HolosTTS/blob/main/holos_mlx/README.md) for usage.
 
+## Android (LiteRT GPU)
+
+The [`holos_litert/kotlin/`](https://github.com/patriotyk/HolosTTS/tree/main/holos_litert/kotlin) folder has a library that runs the model on the phone's GPU with [LiteRT](https://ai.google.dev/edge/litert), and a demo app. On a Pixel 7 it synthesizes with an RTF of 0.13 and gives the first streaming chunk in about 0.4 s. See its [README](https://github.com/patriotyk/HolosTTS/blob/main/holos_litert/kotlin/README.md) for usage.
+
+The same model also runs in Python, in the `holos-tts-litert` package from [`holos_litert/python/`](https://github.com/patriotyk/HolosTTS/tree/main/holos_litert/python) (`pip install holos-tts-litert`). I use it to check the model on a computer and as the reference for the ports.
+
 ## Benchmarks
 
 - **RTF** (real-time factor) is for synthesizing a whole sentence (`generate()` in HolosTTS): the time it takes divided by the duration of the audio. 0.01 means one second of speech in 10 ms; lower is faster.
@@ -182,6 +188,7 @@ python benchmark.py mlx                                         # MLX on Apple s
 | `onnx/` | FP32 ONNX model for `holos-tts-onnx`: CPU, CUDA and TensorRT. |
 | `onnx-int8/` | INT8 ONNX model for CPU. |
 | `mlx/` | MLX model for `holos-tts-mlx`: `config.json`, `model.safetensors` and `voices.npz`. |
+| `litert/` | LiteRT model with FP16 weights for the [Android library](https://github.com/patriotyk/HolosTTS/blob/main/holos_litert/kotlin/README.md). |
 
 Each ONNX folder holds `holos_onnx.json` (vocabulary and parameters), `voices.npz` (preset voices) and the model stages: `encoder.onnx`, `prosody.onnx`, `decoder.onnx`, plus `source.onnx` and `decoder_window.onnx` for streaming.
 

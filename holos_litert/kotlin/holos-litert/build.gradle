@@ -1,0 +1,18 @@
+plugins {
+    id "com.android.library"
+}
+
+android {
+    namespace "com.holos.tts"
+    compileSdk 37
+
+    defaultConfig {
+        minSdk 29
+        consumerProguardFiles "consumer-rules.pro"
+    }
+}
+
+dependencies {
+    api "com.google.ai.edge.litert:litert:2.3.2"
+    implementation "com.google.ai.edge.litert:litert-gpu:2.3.2"
+}
